@@ -34,7 +34,7 @@ Devam etmek için:
 
 **Offline :** PDF Editor · Merge · Split · Rotate · Extract Text · Images ⇄ PDF
 
-**Online :** AI Translate (needs internet + API key) · Word ⇄ PDF (needs a local LibreOffice server)
+**Online :** AI Translate (needs internet + API key)
 
 ## Build it with
 
