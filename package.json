@@ -9,6 +9,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "icon": "node build/make-icon.cjs",
+    "server": "node server/convert-server.js",
     "dev": "vite",
     "build": "vite build",
     "start": "npm run build && electron .",
