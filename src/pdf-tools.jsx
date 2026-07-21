@@ -2409,6 +2409,9 @@ export default function PDFTools() {
       if (apiKey.trim()) {
         fetchHeaders["x-api-key"] = apiKey.trim();
         fetchHeaders["anthropic-version"] = "2023-06-01";
+        // Required for direct calls to the Anthropic API from a browser/Electron
+        // origin — without it the request is rejected by CORS before it is sent.
+        fetchHeaders["anthropic-dangerous-direct-browser-access"] = "true";
       }
 
       const controller = new AbortController();
