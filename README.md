@@ -8,7 +8,7 @@
 
 Download the ready-to-run Windows application:
 
-[Download PDF Tools for Windows](https://github.com/atemelci/Pdf_Tools/releases/latest/download/PDF-Tools.zip)
+[Download PDF Tools for Windows](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.zip)
 
 **EN** — Download the ZIP file, extract it, and double-click the `.exe` file.
 
