@@ -22,11 +22,11 @@ The core tools (PDF Editor, Merge, Split, Rotate, Extract Text, Images ⇄ PDF) 
 
 Download the ready-to-run Windows application:
 
-[Download PDF Tools for Windows](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.zip)
+[Download PDF Tools for Windows](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.exe)
 
-**EN** — Download the ZIP file, extract it, and double-click the `.exe` file.
+**EN** — Download the `.exe` file and double-click it. It is a single portable file — no installation, nothing to extract.
 
-**TR** — ZIP dosyasını indirin, klasöre çıkarın ve `.exe` dosyasına çift tıklayın.
+**TR** — `.exe` dosyasını indirin ve çift tıklayın. Tek, taşınabilir bir dosyadır — kurulum yok, çıkarma yok.
 
 ### Microsoft Defender SmartScreen Warning
 
@@ -98,10 +98,10 @@ sudo apt install ./PDF-Tools.deb
 npm install
 
 # Windows (build on Windows):
-npm run dist:win       # -> release/PDF-Tools-1.0.0.exe
+npm run dist:win       # -> release/PDF-Tools.exe
 
 # Linux (build on Linux):
-npm run dist:linux     # -> release/PDF-Tools-1.0.0.AppImage  +  .deb
+npm run dist:linux     # -> release/PDF-Tools.AppImage  +  PDF-Tools.deb
 ```
 
 Each platform's package must be built on that platform. Built with React + Vite + Electron. Core PDF libraries (`pdf-lib`, `pdf.js`) are bundled locally under `public/vendor/`, so the app works fully offline.

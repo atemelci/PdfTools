@@ -46,7 +46,7 @@
       "icon": "build/icon.ico"
     },
     "portable": {
-      "artifactName": "PDF-Tools-${version}.exe"
+      "artifactName": "PDF-Tools.exe"
     },
     "linux": {
       "target": ["AppImage", "deb"],
