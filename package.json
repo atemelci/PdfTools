@@ -53,7 +53,7 @@
       "icon": "build/icon.png",
       "category": "Office",
       "maintainer": "atemelci <temelcia13@gmail.com>",
-      "artifactName": "PDF-Tools-${version}.${ext}"
+      "artifactName": "PDF-Tools.${ext}"
     },
     "nsis": {
       "oneClick": false,

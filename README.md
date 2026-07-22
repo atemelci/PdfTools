@@ -55,27 +55,27 @@ Two ways to run PDF Tools on Linux — pick whichever you prefer:
 **EN** — A single portable file, just like the Windows `.exe`. After downloading, make it executable and run it:
 
 ```bash
-chmod +x PDF-Tools-*.AppImage
-./PDF-Tools-*.AppImage
+chmod +x PDF-Tools.AppImage
+./PDF-Tools.AppImage
 ```
 
-Or right-click the file → **Properties → Permissions → Allow executing**, then double-click it. If it doesn't start, install FUSE (`sudo apt install libfuse2`) or run it with `./PDF-Tools-*.AppImage --appimage-extract-and-run`.
+Or right-click the file → **Properties → Permissions → Allow executing**, then double-click it. If it doesn't start, install FUSE (`sudo apt install libfuse2`) or run it with `./PDF-Tools.AppImage --appimage-extract-and-run`.
 
 **TR** — Windows'taki `.exe` gibi tek taşınabilir dosya. İndirdikten sonra çalıştırılabilir yapıp açın:
 
 ```bash
-chmod +x PDF-Tools-*.AppImage
-./PDF-Tools-*.AppImage
+chmod +x PDF-Tools.AppImage
+./PDF-Tools.AppImage
 ```
 
-Ya da dosyaya sağ tıklayın → **Özellikler → İzinler → Çalıştırılmasına izin ver**, sonra çift tıklayın. Açılmazsa FUSE kurun (`sudo apt install libfuse2`) veya `./PDF-Tools-*.AppImage --appimage-extract-and-run` ile çalıştırın.
+Ya da dosyaya sağ tıklayın → **Özellikler → İzinler → Çalıştırılmasına izin ver**, sonra çift tıklayın. Açılmazsa FUSE kurun (`sudo apt install libfuse2`) veya `./PDF-Tools.AppImage --appimage-extract-and-run` ile çalıştırın.
 
 ### Option 2 — .deb (install on Debian/Ubuntu)
 
 [Download the .deb package](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.deb)
 
 ```bash
-sudo apt install ./PDF-Tools-*.deb
+sudo apt install ./PDF-Tools.deb
 ```
 
 **EN** — Installs "PDF Tools" into your applications menu. Launch it like any other app.
