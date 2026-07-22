@@ -1,0 +1,61 @@
+name: Deploy Web App to GitHub Pages
+
+# Publishes the browser version of PDF Tools so anyone (Linux, macOS, Windows)
+# can use it without installing anything. The Vite build is fully static, so
+# the built `dist/` folder is served directly from GitHub Pages.
+#
+# One-time setup: in the repository, go to Settings → Pages → Build and
+# deployment → Source and choose "GitHub Actions".
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; newer runs cancel in-progress ones.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        # The Electron binary is not needed to build the web bundle.
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
