@@ -15,7 +15,7 @@
     "start": "npm run build && electron .",
     "dist:win": "npm run icon && npm run build && electron-builder --win portable --x64",
     "dist:win:installer": "npm run icon && npm run build && electron-builder --win nsis --x64",
-    "dist:linux": "npm run icon && npm run build && electron-builder --linux AppImage deb --x64"
+    "dist:linux": "npm run icon && npm run build && electron-builder --linux AppImage deb --x64 --publish never"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
