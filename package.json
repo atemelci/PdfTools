@@ -56,6 +56,9 @@
       "artifactName": "PDF-Tools.${ext}",
       "executableName": "pdf-tools"
     },
+    "deb": {
+      "afterInstall": "build/deb-afterInstall.sh"
+    },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
