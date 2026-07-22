@@ -44,6 +44,44 @@ Devam etmek için:
 1. **Ek bilgi** seçeneğine tıklayın.
 2. **Yine de çalıştır** seçeneğine tıklayın.
 
+## Download for Linux
+
+Two ways to run PDF Tools on Linux — pick whichever you prefer:
+
+### Option 1 — AppImage (no install, one click)
+
+[Download the AppImage](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.AppImage)
+
+**EN** — A single portable file, just like the Windows `.exe`. After downloading, make it executable and run it:
+
+```bash
+chmod +x PDF-Tools.AppImage
+./PDF-Tools.AppImage
+```
+
+Or right-click the file → **Properties → Permissions → Allow executing**, then double-click it. If it doesn't start, install FUSE (`sudo apt install libfuse2`) or run it with `./PDF-Tools.AppImage --appimage-extract-and-run`.
+
+**TR** — Windows'taki `.exe` gibi tek taşınabilir dosya. İndirdikten sonra çalıştırılabilir yapıp açın:
+
+```bash
+chmod +x PDF-Tools.AppImage
+./PDF-Tools.AppImage
+```
+
+Ya da dosyaya sağ tıklayın → **Özellikler → İzinler → Çalıştırılmasına izin ver**, sonra çift tıklayın. Açılmazsa FUSE kurun (`sudo apt install libfuse2`) veya `./PDF-Tools.AppImage --appimage-extract-and-run` ile çalıştırın.
+
+### Option 2 — .deb (install on Debian/Ubuntu)
+
+[Download the .deb package](https://github.com/atemelci/PdfTools/releases/latest/download/PDF-Tools.deb)
+
+```bash
+sudo apt install ./PDF-Tools.deb
+```
+
+**EN** — Installs "PDF Tools" into your applications menu. Launch it like any other app.
+
+**TR** — "PDF Tools"u uygulama menünüze kurar. Diğer uygulamalar gibi başlatabilirsiniz.
+
 ## Features
 
 **Offline :** PDF Editor · Merge · Split · Rotate · Extract Text · Images ⇄ PDF
@@ -52,13 +90,18 @@ Devam etmek için:
 
 ## Build it with
 
-**EN** — Requires [Node.js 18+](https://nodejs.org) on Windows:
+**EN** — Requires [Node.js 18+](https://nodejs.org):
 
-**TR** — Windows'ta [Node.js 18+](https://nodejs.org) gerekir:
+**TR** — [Node.js 18+](https://nodejs.org) gerekir:
 
 ```bash
-npm install      
-npm run dist:win     # -> release/PDF-Tools-1.0.0.exe
+npm install
+
+# Windows (build on Windows):
+npm run dist:win       # -> release/PDF-Tools-1.0.0.exe
+
+# Linux (build on Linux):
+npm run dist:linux     # -> release/PDF-Tools-1.0.0.AppImage  +  .deb
 ```
 
-Built with React + Vite + Electron. Core PDF libraries (`pdf-lib`, `pdf.js`) are bundled locally under `public/vendor/`, so the app works fully offline.
+Each platform's package must be built on that platform. Built with React + Vite + Electron. Core PDF libraries (`pdf-lib`, `pdf.js`) are bundled locally under `public/vendor/`, so the app works fully offline.

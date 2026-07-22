@@ -14,7 +14,8 @@
     "build": "vite build",
     "start": "npm run build && electron .",
     "dist:win": "npm run icon && npm run build && electron-builder --win portable --x64",
-    "dist:win:installer": "npm run icon && npm run build && electron-builder --win nsis --x64"
+    "dist:win:installer": "npm run icon && npm run build && electron-builder --win nsis --x64",
+    "dist:linux": "npm run icon && npm run build && electron-builder --linux AppImage deb --x64 --publish never"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
@@ -46,6 +47,13 @@
     },
     "portable": {
       "artifactName": "PDF-Tools-${version}.exe"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "build/icon.png",
+      "category": "Office",
+      "maintainer": "atemelci <temelcia13@gmail.com>",
+      "artifactName": "PDF-Tools.${ext}"
     },
     "nsis": {
       "oneClick": false,
