@@ -2,7 +2,7 @@
   "name": "pdf-tools",
   "productName": "PDF Tools",
   "version": "1.0.0",
-  "description": "Offline PDF toolkit — merge, split, rotate, edit, extract and convert PDFs. Runs as a standalone Windows app with no installation or internet required.",
+  "description": "Offline PDF toolkit: merge, split, rotate, edit, extract and convert PDFs.",
   "author": "PdfTools",
   "license": "MIT",
   "private": true,
@@ -27,7 +27,7 @@
   },
   "build": {
     "appId": "com.pdftools.desktop",
-    "productName": "PDF Tools",
+    "productName": "PDF-Tools",
     "directories": {
       "output": "release",
       "buildResources": "build"
