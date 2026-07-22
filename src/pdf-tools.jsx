@@ -1970,7 +1970,7 @@ function PDFEditor({ pdfLib }) {
 export default function PDFTools() {
   const [activeTool, setActiveTool]     = useState("editor");
   const [files, setFiles]               = useState([]);
-  const [options, setOptions]           = useState({ pages:"", rotation:"90", splitMode:"pages", translateFrom:"en", translateTo:"tr", imgFit:"fit", imgOrient:"portrait", imgFormat:"png", imgQuality:"2", convertServer:"http://localhost:3000" });
+  const [options, setOptions]           = useState({ pages:"", rotation:"90", splitMode:"pages", translateFrom:"en", translateTo:"tr", translateEngine:"claude", imgFit:"fit", imgOrient:"portrait", imgFormat:"png", imgQuality:"2", convertServer:"http://localhost:3000" });
   const [outputName, setOutputName]     = useState("output");
   const [loading, setLoading]           = useState(false);
   const [dropZoneDrag, setDropZoneDrag] = useState(false);
@@ -1987,6 +1987,19 @@ export default function PDFTools() {
   const pdfJsRef                        = useRef(null); // pdf.js instance — ref-scoped, never stale across remounts
   const [apiKey, setApiKey]             = useState(() => { try { return localStorage.getItem("anthropic_api_key") || ""; } catch (_) { return ""; } });
   const [showKey, setShowKey]           = useState(false);
+  // Saved Anthropic keys — a small address-book so long keys are picked, not retyped.
+  const [savedKeys, setSavedKeys]       = useState(() => { try { return JSON.parse(localStorage.getItem("anthropic_api_keys") || "[]"); } catch (_) { return []; } });
+  const persistKeys = (list) => { setSavedKeys(list); try { localStorage.setItem("anthropic_api_keys", JSON.stringify(list)); } catch (_) {} };
+  const saveCurrentKey = () => {
+    const key = apiKey.trim();
+    if (!key) return;
+    if (savedKeys.some(k => k.key === key)) return;   // already saved
+    const label = (typeof window !== "undefined" && window.prompt)
+      ? (window.prompt("Name this key (e.g. Work, Personal):", `Key …${key.slice(-4)}`) || `Key …${key.slice(-4)}`)
+      : `Key …${key.slice(-4)}`;
+    persistKeys([...savedKeys, { label: label.trim() || `Key …${key.slice(-4)}`, key }]);
+  };
+  const removeSavedKey = (key) => persistKeys(savedKeys.filter(k => k.key !== key));
 
   useEffect(() => {
     // Check synchronously first (already cached on window from a previous mount)
@@ -2302,6 +2315,79 @@ export default function PDFTools() {
     { code:"ko", label:"Korean"     },
   ];
 
+  // Build the downloadable HTML result once the translation text is ready.
+  // Shared by both the Claude and Google Translate engines.
+  const buildTranslationResult = (translated, fromLang, toLang, extracted, runId) => {
+    const htmlContent = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${fromLang} to ${toLang} Translation</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;700&display=swap');
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Noto Sans',sans-serif;font-size:11.5pt;line-height:1.75;color:#1a1a1a;background:#fff;padding:36pt 48pt;max-width:740px;margin:auto}
+    header{border-bottom:2px solid #1a3a6e;padding-bottom:10pt;margin-bottom:24pt}
+    h1{font-size:14pt;color:#1a3a6e;margin-bottom:4pt}
+    .meta{font-size:9pt;color:#666}
+    p{margin-bottom:10pt;text-align:justify}
+    @media print{body{padding:0}header{page-break-after:avoid}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>${fromLang} &rarr; ${toLang} Translation</h1>
+    <div class="meta">Source: ${files[0].name} &nbsp;&middot;&nbsp; ${new Date().toLocaleDateString()}</div>
+  </header>
+  ${translated.split(/\n\n+/).map(p => p.trim() ? `<p>${p.trim().replace(/\n/g,' ')}</p>` : '').join('\n  ')}
+</body>
+</html>`;
+    const blob = new Blob([htmlContent], { type: "text/html;charset=utf-8" });
+    const url  = URL.createObjectURL(blob);
+    const fname = `${files[0].name.replace(/\.pdf$/i,"")}_${toLang.toLowerCase()}.html`;
+    if (activeRunRef.current !== runId) return;
+    setResult({ url, filename: fname, translated, from: fromLang, to: toLang, charCount: extracted.length, isHtml: true });
+  };
+
+  // Free, keyless translation via Google's public endpoint. No API key needed.
+  // The text is split into chunks (the endpoint is GET-only with a URL limit)
+  // and translated sequentially, streaming the result in as each chunk lands.
+  const runGoogleTranslate = async (extracted, fromLang, toLang, runId) => {
+    const sl = options.translateFrom || "en";
+    const tl = options.translateTo || "tr";
+
+    // Group paragraphs into ~1200-char chunks to stay under the URL length limit.
+    const paras = extracted.split(/\n\n+/);
+    const chunks = [];
+    let cur = "";
+    for (const p of paras) {
+      if (cur && (cur.length + p.length + 2) > 1200) { chunks.push(cur); cur = p; }
+      else cur = cur ? cur + "\n\n" + p : p;
+    }
+    if (cur) chunks.push(cur);
+
+    let translated = "";
+    for (const chunk of chunks) {
+      if (activeRunRef.current !== runId) return;
+      const url = "https://translate.googleapis.com/translate_a/single?client=gtx"
+        + `&sl=${encodeURIComponent(sl)}&tl=${encodeURIComponent(tl)}&dt=t&q=${encodeURIComponent(chunk)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Google Translate returned ${res.status}. Try again, or use fewer pages.`);
+      const data = await res.json();
+      const piece = (data?.[0] || []).map(seg => seg?.[0] || "").join("");
+      translated += (translated ? "\n\n" : "") + piece.trim();
+      if (activeRunRef.current === runId) setResult(prev => ({ ...prev, preview: translated }));
+    }
+
+    if (!translated.trim()) {
+      setError("Translation returned empty result. Please try again.");
+      setResult(null);
+      return;
+    }
+    buildTranslationResult(translated, fromLang, toLang, extracted, runId);
+  };
+
   const runTranslate = async (runId) => {
     // Step 1: load pdf.js if not already loaded for this component instance
     const getPdfJs = () => new Promise((resolve, reject) => {
@@ -2398,7 +2484,19 @@ export default function PDFTools() {
     const fromLang = LANGUAGES.find(l => l.code === options.translateFrom)?.label || "English";
     const toLang   = LANGUAGES.find(l => l.code === options.translateTo)?.label   || "Turkish";
 
-    setResult({ translating: true, from: fromLang, to: toLang, preview: "" });
+    setResult({ translating: true, from: fromLang, to: toLang, preview: "", engine: options.translateEngine });
+
+    // Free engine — no API key, translate via Google's public endpoint.
+    if (options.translateEngine === "google") {
+      try {
+        await runGoogleTranslate(extracted, fromLang, toLang, runId);
+      } catch (e) {
+        if (activeRunRef.current !== runId) return;
+        setError("Google Translate error: " + e.message);
+        setResult(null);
+      }
+      return;
+    }
 
     try {
       // Step 3: streaming API call — words appear live as they're generated
@@ -2501,38 +2599,8 @@ export default function PDFTools() {
 
       if (activeRunRef.current !== runId) return;
 
-         // Step 4: generate a UTF-8 HTML file — full Unicode, no font embedding issues
-      const htmlContent = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>${fromLang} to ${toLang} Translation</title>
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;700&display=swap');
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:'Noto Sans',sans-serif;font-size:11.5pt;line-height:1.75;color:#1a1a1a;background:#fff;padding:36pt 48pt;max-width:740px;margin:auto}
-    header{border-bottom:2px solid #1a3a6e;padding-bottom:10pt;margin-bottom:24pt}
-    h1{font-size:14pt;color:#1a3a6e;margin-bottom:4pt}
-    .meta{font-size:9pt;color:#666}
-    p{margin-bottom:10pt;text-align:justify}
-    @media print{body{padding:0}header{page-break-after:avoid}}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>${fromLang} &rarr; ${toLang} Translation</h1>
-    <div class="meta">Source: ${files[0].name} &nbsp;&middot;&nbsp; ${new Date().toLocaleDateString()}</div>
-  </header>
-  ${translated.split(/\n\n+/).map(p => p.trim() ? `<p>${p.trim().replace(/\n/g,' ')}</p>` : '').join('\n  ')}
-</body>
-</html>`;
-
-      const blob = new Blob([htmlContent], { type: "text/html;charset=utf-8" });
-      const url  = URL.createObjectURL(blob);
-      const fname = `${files[0].name.replace(/\.pdf$/i,"")}_${toLang.toLowerCase()}.html`;
-      if (activeRunRef.current !== runId) return;
-      setResult({ url, filename: fname, translated, from: fromLang, to: toLang, charCount: extracted.length, isHtml: true });
+      // Step 4: generate a UTF-8 HTML file — full Unicode, no font embedding issues
+      buildTranslationResult(translated, fromLang, toLang, extracted, runId);
 
     } catch(e) {
       if (e.name === "AbortError") return; // silently drop — a new run has started
@@ -2671,7 +2739,7 @@ export default function PDFTools() {
                 setFiles([]);
                 setLoading(false);
                 setOutputName("output");
-                setOptions({ pages:"", rotation:"90", splitMode:"pages", translateFrom: options.translateFrom, translateTo: options.translateTo, imgFit:"fit", imgOrient:"portrait", imgFormat:"png", imgQuality:"2", convertServer: options.convertServer||"http://localhost:3000" });
+                setOptions({ pages:"", rotation:"90", splitMode:"pages", translateFrom: options.translateFrom, translateTo: options.translateTo, translateEngine: options.translateEngine||"claude", imgFit:"fit", imgOrient:"portrait", imgFormat:"png", imgQuality:"2", convertServer: options.convertServer||"http://localhost:3000" });
               }} style={{
               display:"flex", alignItems:"center", gap:"11px", width:"100%", padding:"10px 18px",
               background: activeTool===t.id ? T.accentBg : "transparent",
@@ -2782,9 +2850,53 @@ export default function PDFTools() {
                   </div>
                 </div>
 
-                {/* API Key input — required outside Claude's artifact platform */}
+                {/* Translation engine — Claude (needs key) or Google Translate (free) */}
+                <div style={{ marginBottom:"14px", background:"rgba(0,0,0,.03)", border:"1px solid rgba(0,0,0,.07)", borderRadius:"11px", padding:"12px 16px" }}>
+                  <div style={{ fontSize:"10px", letterSpacing:".12em", color:"#8C8C88", textTransform:"uppercase", marginBottom:"8px" }}>Translation Engine</div>
+                  <div style={{ display:"flex", gap:"8px" }}>
+                    {[
+                      { id:"claude", label:"Claude AI", note:"Best quality · needs API key" },
+                      { id:"google", label:"Google Translate", note:"Free · no key needed" },
+                    ].map(m=>(
+                      <button key={m.id} onClick={()=>setOptions(o=>({...o,translateEngine:m.id}))} style={{
+                        flex:1, textAlign:"left", padding:"9px 12px", borderRadius:"9px", border:"1px solid",
+                        borderColor: options.translateEngine===m.id ? "#D81F3F" : "rgba(0,0,0,.12)",
+                        background: options.translateEngine===m.id ? "rgba(216,31,63,.1)" : "rgba(0,0,0,.02)",
+                        cursor:"pointer", fontFamily:"inherit",
+                      }}>
+                        <div style={{ fontSize:"13px", fontWeight:600, color: options.translateEngine===m.id ? "#D81F3F" : "#5C5C5A" }}>{m.label}</div>
+                        <div style={{ fontSize:"10px", color:"#8C8C88", marginTop:"2px" }}>{m.note}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* API Key — only for the Claude engine. Includes a saved-keys picker. */}
+                {options.translateEngine==="claude" && (
                 <div style={{ marginBottom:"14px", background:"rgba(0,0,0,.03)", border:"1px solid rgba(0,0,0,.07)", borderRadius:"11px", padding:"12px 16px" }}>
                   <div style={{ fontSize:"10px", letterSpacing:".12em", color:"#8C8C88", textTransform:"uppercase", marginBottom:"8px" }}>Anthropic API Key</div>
+
+                  {/* Saved keys — pick instead of retyping */}
+                  {savedKeys.length > 0 && (
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:"6px", marginBottom:"8px" }}>
+                      {savedKeys.map(k => {
+                        const active = k.key === apiKey.trim();
+                        return (
+                          <span key={k.key} style={{ display:"flex", alignItems:"center", gap:"6px", padding:"5px 8px 5px 10px", borderRadius:"7px",
+                            border:`1px solid ${active ? "#D81F3F" : "rgba(0,0,0,.12)"}`, background: active ? "rgba(216,31,63,.1)" : "rgba(0,0,0,.03)" }}>
+                            <button onClick={()=>{ setApiKey(k.key); try { localStorage.setItem("anthropic_api_key", k.key); } catch(_){} }}
+                              title="Use this key" style={{ background:"none", border:"none", cursor:"pointer", fontSize:"12px", fontFamily:"inherit",
+                              color: active ? "#D81F3F" : "#5C5C5A", fontWeight: active ? 600 : 400, padding:0 }}>
+                              {active ? "✓ " : ""}{k.label} <span style={{ color:"#B6B5B0", fontFamily:T.mono }}>…{k.key.slice(-4)}</span>
+                            </button>
+                            <button onClick={()=>removeSavedKey(k.key)} title="Remove saved key" style={{ background:"none", border:"none", cursor:"pointer", color:"#B6B5B0", fontSize:"12px", padding:0, lineHeight:1 }}
+                              onMouseEnter={e=>e.currentTarget.style.color="#B01E2E"} onMouseLeave={e=>e.currentTarget.style.color="#B6B5B0"}>✕</button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+
                   <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
                     <input
                       type={showKey ? "text" : "password"}
@@ -2801,10 +2913,19 @@ export default function PDFTools() {
                     </button>
                     {apiKey && <button onClick={()=>{ setApiKey(""); try { localStorage.removeItem("anthropic_api_key"); } catch (_) {} }} title="Clear key" style={{ padding:"7px 10px", borderRadius:"8px", border:"1px solid rgba(176,30,46,.2)", background:"rgba(176,30,46,.08)", color:"#B01E2E", cursor:"pointer", fontSize:"12px", flexShrink:0 }}>✕</button>}
                   </div>
-                  <div style={{ fontSize:"10px", color:"#B6B5B0", marginTop:"6px" }}>
-                    {apiKey ? "Key saved in this browser" : "No key needed here. Paste your key only when running this file elsewhere."}
+
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginTop:"6px", gap:"8px" }}>
+                    <div style={{ fontSize:"10px", color:"#B6B5B0" }}>
+                      {apiKey ? "Key saved in this browser" : "No key needed here. Paste your key only when running this file elsewhere."}
+                    </div>
+                    {apiKey.trim() && !savedKeys.some(k=>k.key===apiKey.trim()) && (
+                      <button onClick={saveCurrentKey} style={{ flexShrink:0, padding:"5px 12px", borderRadius:"7px", border:"1px solid rgba(216,31,63,.35)", background:"rgba(216,31,63,.08)", color:"#D81F3F", cursor:"pointer", fontSize:"11px", fontWeight:600, fontFamily:"inherit" }}>
+                        + Save this key
+                      </button>
+                    )}
                   </div>
                 </div>
+                )}
                 </>
               )}
 
