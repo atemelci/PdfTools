@@ -10,10 +10,9 @@
 
 **➡️ [Open PDF Tools in your browser](https://atemelci.github.io/PdfTools/)**
 
-**EN** — The core tools (PDF Editor, Merge, Split, Rotate, Extract Text, Images ⇄ PDF) run entirely in your browser — your files never leave your computer. AI Translate needs an API key, and Word ⇄ PDF needs the local conversion server (see below).
+**EN** — The tools run entirely in your browser.
 
-**TR** — Çekirdek araçlar (PDF Düzenleyici, Birleştir, Böl, Döndür, Metin Çıkar, Görsel ⇄ PDF) tamamen tarayıcınızda çalışır — dosyalarınız bilgisayarınızdan çıkmaz. AI Çeviri için bir API anahtarı, Word ⇄ PDF için ise yerel dönüştürme sunucusu (aşağıya bakın) gerekir.
-
+**TR** — Tüm araçlar tamamen varsayılan tarayıcınızda çalışır.
 ## Download for Windows
 
 Download the ready-to-run Windows application:
