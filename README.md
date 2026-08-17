@@ -58,11 +58,6 @@ Or right-click the file → **Properties → Permissions → Allow executing**, 
 
 **TR** — Windows'taki `.exe` gibi tek taşınabilir dosya. İndirdikten sonra çalıştırılabilir yapıp açın:
 
-```bash
-chmod +x PDF-Tools.AppImage
-./PDF-Tools.AppImage
-```
-
 Ya da dosyaya sağ tıklayın → **Özellikler → İzinler → Çalıştırılmasına izin ver**, sonra çift tıklayın. Açılmazsa FUSE kurun (`sudo apt install libfuse2`) veya `./PDF-Tools.AppImage --appimage-extract-and-run` ile çalıştırın.
 
 ### Option 2 — .deb (install on Debian/Ubuntu)
@@ -86,8 +81,6 @@ sudo apt install ./PDF-Tools.deb
 ## Build it with
 
 **EN** — Requires [Node.js 18+](https://nodejs.org):
-
-**TR** — [Node.js 18+](https://nodejs.org) gerekir:
 
 ```bash
 npm install
