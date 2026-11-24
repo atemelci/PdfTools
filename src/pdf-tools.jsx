@@ -939,27 +939,41 @@ function PDFEditor({ pdfLib }) {
       pdfJsDocRef.current = await pdfJsRef.current.getDocument({ data: arrForPdfJs }).promise;
       setPageCount(pdfJsDocRef.current.numPages);
 
+      const doc = await pdfLib.PDFDocument.load(arrForPdfLib);
+      setPdfDoc(doc);
+
       // Read notes already embedded in the PDF (highlight pop-ups, sticky notes,
-      // free-text, etc.) so they can be read in the Comments panel and on page.
+      // free-text …) straight from pdf-lib, keeping each one's exact annotation
+      // index so its text can later be edited in place — no duplication.
       const existingNotes = [];
       try {
-        const jsdoc = pdfJsDocRef.current;
-        for (let p = 1; p <= jsdoc.numPages; p++) {
-          const pg = await jsdoc.getPage(p);
-          const vp = pg.getViewport({ scale });
-          const anns = await pg.getAnnotations();
-          anns.forEach((an, i) => {
-            // pdf.js exposes the note text as `contentsObj.str` (newer builds)
-            // or `contents` (older). Adobe stores a highlight's note here too.
-            const text = ((an.contentsObj && an.contentsObj.str) || an.contents || "").trim();
-            if (!text) return;   // only annotations that actually carry a note
-            const author = (an.titleObj && an.titleObj.str) || an.title || "";
-            const r = an.rect ? vp.convertToViewportRectangle(an.rect) : [0, 0, 0, 0];
-            const x = Math.min(r[0], r[2]), y = Math.min(r[1], r[3]);
-            const w = Math.max(10, Math.abs(r[2] - r[0])), h = Math.max(10, Math.abs(r[3] - r[1]));
-            existingNotes.push({ id:`pdfnote-${p}-${i}`, page:p-1, type:"note", existing:true, x, y, w, h, comment:text, author, subtype:an.subtype || "Note" });
-          });
-        }
+        const { PDFName, PDFDict, PDFArray } = pdfLib;
+        doc.getPages().forEach((page, pageIdx) => {
+          const annots = page.node.Annots && page.node.Annots();
+          if (!annots) return;
+          const pageH = page.getSize().height;
+          for (let i = 0; i < annots.size(); i++) {
+            let d; try { d = annots.lookup(i, PDFDict); } catch (_) { continue; }
+            if (!d) continue;
+            const sub = d.get(PDFName.of("Subtype"));
+            const subStr = sub ? sub.toString() : "";          // e.g. "/Highlight"
+            const c = d.get(PDFName.of("Contents"));
+            let text = "";
+            try { if (c && c.decodeText) text = c.decodeText(); } catch (_) {}
+            if (!text || !text.trim()) continue;                // only annotations with a note
+            let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            try {
+              const rect = d.lookup(PDFName.of("Rect"), PDFArray);
+              if (rect) { x1 = rect.lookup(0).asNumber(); y1 = rect.lookup(1).asNumber(); x2 = rect.lookup(2).asNumber(); y2 = rect.lookup(3).asNumber(); }
+            } catch (_) {}
+            const cx = Math.min(x1, x2) * scale, cyTop = (pageH - Math.max(y1, y2)) * scale;
+            existingNotes.push({
+              id:`pdfnote-${pageIdx}-${i}`, page:pageIdx, type:"note", existing:true, annotIndex:i,
+              x:cx, y:cyTop, w:Math.max(12, Math.abs(x2 - x1) * scale), h:Math.max(12, Math.abs(y2 - y1) * scale),
+              comment:text.trim(), origComment:text.trim(), subtype:subStr,
+            });
+          }
+        });
       } catch (_) { /* annotations are optional — ignore read errors */ }
       if (existingNotes.length) {
         setAnnotations(existingNotes);
@@ -968,8 +982,6 @@ function PDFEditor({ pdfLib }) {
         historyIdxRef.current = 0;
       }
 
-      const doc = await pdfLib.PDFDocument.load(arrForPdfLib);
-      setPdfDoc(doc);
       setCurrentPage(0);
       setDocVersion(v => v + 1);   // guarantees the render effect runs even if currentPage was already 0
     } catch (e) { setError("Could not load PDF: " + e.message); }
@@ -1175,7 +1187,9 @@ function PDFEditor({ pdfLib }) {
     setSaving(true);
     try {
       const { rgb, StandardFonts, PDFName, PDFNumber, PDFArray, PDFDict, PDFHexString, PDFRawStream, PDFBool } = pdfLib;
-      const doc   = pdfDoc;
+      // Re-load the ORIGINAL file for every save so output never accumulates
+      // duplicate annotations or re-stamped drawings across repeated saves.
+      const doc   = file ? await pdfLib.PDFDocument.load(await file.arrayBuffer()) : pdfDoc;
       const pages = doc.getPages();
       const ctx   = doc.context;
 
@@ -1261,6 +1275,31 @@ function PDFEditor({ pdfLib }) {
         const key = fo.pdfLib + (ann.bold ? "Bold" : "");
         return fontMap[key] || fontMap[fo.pdfLib] || fontMap["Helvetica"];
       };
+
+      // ── Imported notes: edit in place (update text, or remove if cleared) ──
+      // Each carries the exact annotation index it was read from, so we edit the
+      // original annotation rather than adding a duplicate.
+      const noteRemovals = [];
+      for (const ann of annotations) {
+        if (!ann.existing || typeof ann.annotIndex !== "number") continue;
+        try {
+          const page = pages[ann.page];
+          const annots = page.node.Annots && page.node.Annots();
+          if (!annots || ann.annotIndex >= annots.size()) continue;
+          const text = (ann.comment || "").trim();
+          if (!text) {
+            noteRemovals.push({ annots, idx: ann.annotIndex });     // cleared → drop it
+          } else if (text !== (ann.origComment || "")) {
+            const d = annots.lookup(ann.annotIndex, PDFDict);
+            if (d) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));  // edited → update text
+          }
+        } catch (_) { /* leave original untouched on any error */ }
+      }
+      // Remove cleared notes highest-index-first so earlier indices stay valid.
+      noteRemovals.sort((a, b) => b.idx - a.idx);
+      for (const r of noteRemovals) {
+        try { const ref = r.annots.get(r.idx); r.annots.remove(r.idx); if (ref) { try { ctx.delete(ref); } catch (_) {} } } catch (_) {}
+      }
 
       for (const ann of annotations) {
         const page = pages[ann.page];
@@ -2278,7 +2317,7 @@ function PDFEditor({ pdfLib }) {
           {activeComment != null && (() => {
             const a = annotations.find(x => x.id === activeComment);
             if (!a) return null;
-            const readOnly = !!a.existing;
+            const readOnly = false;   // imported notes are editable too (updated in place on save)
             const swatch = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : (a.existing ? "#D81F3F" : T.accent);
             return (
               <>
@@ -2286,7 +2325,7 @@ function PDFEditor({ pdfLib }) {
                 <div onMouseDown={e=>e.stopPropagation()} style={{ position:"fixed", left:commentPos.left+"px", top:commentPos.top+"px", zIndex:1200, width:"270px", background:"#fff", border:`1px solid ${T.borderUp}`, borderRadius:"12px", boxShadow:"0 16px 44px rgba(0,0,0,.26)", overflow:"hidden", animation:"fadeIn .12s" }}>
                   <div style={{ display:"flex", alignItems:"center", gap:"8px", padding:"10px 12px", borderBottom:`1px solid ${T.border}`, background:"rgba(0,0,0,.02)" }}>
                     <span style={{ width:"13px", height:"13px", borderRadius:"3px", background:swatch, border:"1px solid rgba(0,0,0,.2)", flexShrink:0 }}/>
-                    <span style={{ fontSize:"12px", fontWeight:600, color:T.text }}>{readOnly ? "Note (from PDF)" : "Note"}</span>
+                    <span style={{ fontSize:"12px", fontWeight:600, color:T.text }}>{a.existing ? "Note (from PDF)" : "Note"}</span>
                     <span style={{ fontSize:"10.5px", color:T.faint, fontFamily:T.mono }}>p.{a.page+1}</span>
                     <button onClick={closeCommentPopup} title="Close" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={15}/></button>
                   </div>
