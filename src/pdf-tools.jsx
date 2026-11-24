@@ -172,6 +172,16 @@ const SHAPES = [
   { id:"cross",     label:"Cross",        icon:"✕"                 },
 ];
 
+/* Greek letters & common science/math symbols, for the Markers symbol picker.
+   Inserted as rendered images so they export to PDF regardless of font. */
+const SCIENCE_SYMBOLS = [
+  "α","β","γ","δ","ε","ζ","η","θ","ι","κ","λ","μ",
+  "ν","ξ","ο","π","ρ","σ","τ","υ","φ","χ","ψ","ω",
+  "Γ","Δ","Θ","Λ","Ξ","Π","Σ","Φ","Ψ","Ω",
+  "∑","∏","∫","√","∞","∂","∇","±","×","÷","·","≈",
+  "≤","≥","≠","≡","→","←","⇒","⇌","°","′","″","ℏ",
+];
+
 function parsePageRanges(input, totalPages) {
   if (!input || !input.trim()) return Array.from({ length: totalPages }, (_, i) => i);
   const pages = new Set();
@@ -685,6 +695,7 @@ function PDFEditor({ pdfLib }) {
   const [strokeWidth, setStrokeWidth]     = useState(2);
   const [fillShape, setFillShape]         = useState(false);
   const [highlightColor, setHighlightColor] = useState("rgba(255,230,0,0.45)");
+  const [showSymbols, setShowSymbols]       = useState(false);   // Markers symbol popover
 
   // Image tool state
   const [imageDataUrl, setImageDataUrl]     = useState(null);
@@ -704,6 +715,18 @@ function PDFEditor({ pdfLib }) {
   // Resize functionality states
   const [isResizing, setIsResizing] = useState(false);
   const [resizeData, setResizeData] = useState(null);
+
+  // Comments / annotation panel (Adobe-style)
+  const [showComments, setShowComments] = useState(true);
+  const [commentSearch, setCommentSearch] = useState("");
+  const commentRefs = useRef({});   // id -> textarea node, for focusing
+
+  // Jump to an annotation: switch page, select it, focus its comment box.
+  const goToAnnotation = (ann) => {
+    if (ann.page !== currentPage) setCurrentPage(ann.page);
+    setSelected(ann.id);
+    setTimeout(() => commentRefs.current[ann.id]?.focus(), 60);
+  };
 
   const canvasRef    = useRef();
   const overlayRef   = useRef();
@@ -901,10 +924,21 @@ function PDFEditor({ pdfLib }) {
     const page   = await pdfJsDocRef.current.getPage(pageIdx + 1);
     const vp     = page.getViewport({ scale });
     const canvas = canvasRef.current;
-    canvas.width = vp.width; canvas.height = vp.height;
+    // Render at device-pixel resolution for crisp, Adobe-quality text and
+    // highlights on HiDPI/Retina screens, but keep the CSS size in logical
+    // pixels so annotation coordinates (stored in CSS px) stay aligned.
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    canvas.width  = Math.floor(vp.width  * dpr);
+    canvas.height = Math.floor(vp.height * dpr);
+    canvas.style.width  = vp.width  + "px";
+    canvas.style.height = vp.height + "px";
     const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, vp.width, vp.height);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    await page.render({
+      canvasContext: ctx,
+      viewport: vp,
+      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+    }).promise;
   }, [scale]);
 
   useEffect(() => { renderPage(currentPage); }, [currentPage, scale, renderPage, docVersion]);
@@ -1045,6 +1079,36 @@ function PDFEditor({ pdfLib }) {
     if (!selected) return;
     pushHistory(annotations.filter(a => a.id !== selected));
     setSelected(null);
+  };
+
+  // Insert a Greek/science symbol. Rendered to a transparent PNG (so it exports
+  // to PDF regardless of font support) and placed as a movable/resizable image.
+  const insertSymbol = (ch) => {
+    const fs = 72, pad = 10;
+    const meas = document.createElement("canvas").getContext("2d");
+    meas.font = `${fs}px 'Times New Roman', serif`;
+    const w = Math.max(24, Math.ceil(meas.measureText(ch).width) + pad * 2);
+    const h = Math.ceil(fs * 1.25) + pad;
+    const EX = 4;
+    const cvs = document.createElement("canvas");
+    cvs.width = w * EX; cvs.height = h * EX;
+    const ctx = cvs.getContext("2d");
+    ctx.scale(EX, EX);
+    ctx.fillStyle = fontColor || "#000000";
+    ctx.font = `${fs}px 'Times New Roman', serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(ch, w / 2, h / 2);
+    const dataUrl = cvs.toDataURL("image/png");
+    const dispH = 40, dispW = Math.round((w / h) * dispH);
+    const newAnn = {
+      id: Date.now(), page: currentPage, type: "image", isSymbol: true,
+      x: 60, y: 60, w: dispW, h: dispH, src: dataUrl, mimeType: "image/png",
+    };
+    pushHistory([...annotations, newAnn]);
+    setSelected(newAnn.id);
+    setEditMode("select");
+    setShowSymbols(false);
   };
 
   const savePDF = async () => {
@@ -1487,6 +1551,38 @@ function PDFEditor({ pdfLib }) {
             color:       fillShape ? "#80b0ff" : "#8C8C88",
             cursor:"pointer", fontSize:"12px", fontFamily:"inherit",
           }}>{fillShape ? "Filled" : "Outline only"}</button>
+
+          <div style={{ width:"1px", height:"24px", background:"rgba(0,0,0,.10)", margin:"0 4px" }}/>
+
+          {/* Science / Greek symbol picker — a little hidden window of α β γ θ … */}
+          <div style={{ position:"relative" }}>
+            <button onClick={() => setShowSymbols(s => !s)} title="Insert a Greek / science symbol" style={{
+              padding:"5px 12px", borderRadius:"7px", border:"1px solid",
+              borderColor: showSymbols ? "#80b0ff" : "rgba(0,0,0,.12)",
+              background:  showSymbols ? "rgba(216,31,63,.18)" : "rgba(0,0,0,.035)",
+              color:       showSymbols ? "#80b0ff" : "#5C5C5A",
+              cursor:"pointer", display:"flex", alignItems:"center", gap:"6px",
+            }}><span style={{ fontSize:"15px", fontFamily:"'Times New Roman', serif" }}>Ω</span><span style={{ fontSize:"11px" }}>Symbols</span></button>
+            {showSymbols && (
+              <div style={{ position:"absolute", top:"calc(100% + 6px)", left:0, zIndex:40, background:"#fff", border:`1px solid ${T.borderUp}`, borderRadius:"10px", boxShadow:"0 10px 30px rgba(0,0,0,.18)", padding:"10px", width:"252px" }}>
+                <div style={{ fontSize:"10px", letterSpacing:".08em", color:T.faint, textTransform:"uppercase", marginBottom:"8px" }}>Insert symbol</div>
+                <div style={{ display:"grid", gridTemplateColumns:"repeat(8, 1fr)", gap:"4px", maxHeight:"184px", overflowY:"auto" }}>
+                  {SCIENCE_SYMBOLS.map(ch => (
+                    <button key={ch} onClick={() => insertSymbol(ch)} title={`Insert ${ch}`} style={{
+                      height:"28px", display:"flex", alignItems:"center", justifyContent:"center",
+                      border:`1px solid ${T.border}`, borderRadius:"6px", background:"rgba(0,0,0,.02)",
+                      color:T.text, cursor:"pointer", fontSize:"17px", fontFamily:"'Times New Roman', serif",
+                    }}
+                    onMouseEnter={e=>{ e.currentTarget.style.background="rgba(216,31,63,.1)"; e.currentTarget.style.borderColor=T.accent; }}
+                    onMouseLeave={e=>{ e.currentTarget.style.background="rgba(0,0,0,.02)"; e.currentTarget.style.borderColor=T.border; }}>
+                      {ch}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ fontSize:"10px", color:T.faintest, marginTop:"8px", lineHeight:1.5 }}>Placed on the page in the current color — drag to position, corner-handles to resize.</div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1697,6 +1793,10 @@ function PDFEditor({ pdfLib }) {
             </div>
           )}
 
+          {/* Canvas + comments panel, side by side */}
+          <div style={{ display:"flex", gap:"16px", alignItems:"flex-start", width:"100%" }}>
+            <div style={{ flex:"1 1 auto", minWidth:0 }}>
+
           {/* Canvas + SVG overlay */}
           <div style={{ position:"relative", display:"inline-block", lineHeight:0, border:"1px solid rgba(0,0,0,.08)", borderRadius:"4px", overflow:"hidden", alignSelf:"flex-start", boxShadow:"0 1px 3px rgba(0,0,0,.10), 0 8px 24px rgba(0,0,0,.06)" }}>
             <canvas ref={canvasRef} style={{ display:"block" }} />
@@ -1722,8 +1822,19 @@ function PDFEditor({ pdfLib }) {
                   </g>
                 );
                 if (ann.type === "highlight") return (
-                  <rect key={ann.id} x={ann.x} y={ann.y} width={ann.w} height={ann.h}
-                    fill={ann.color || "rgba(255,230,0,.45)"} stroke={selStroke} strokeWidth={sel?2:0} strokeDasharray={dash} />
+                  <g key={ann.id}>
+                    <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h}
+                      fill={ann.color || "rgba(255,230,0,.45)"} stroke={selStroke} strokeWidth={sel?2:0} strokeDasharray={dash}>
+                      {ann.comment ? <title>{ann.comment}</title> : null}
+                    </rect>
+                    {/* Comment marker — a small dog-ear badge on highlights that carry a note */}
+                    {ann.comment && (
+                      <g style={{ pointerEvents:"none" }}>
+                        <circle cx={ann.x + ann.w} cy={ann.y} r={7} fill="#D81F3F" stroke="#fff" strokeWidth={1.5}/>
+                        <path d={`M${ann.x+ann.w-3},${ann.y-1} h6 M${ann.x+ann.w-3},${ann.y+2} h6`} stroke="#fff" strokeWidth={1.1} strokeLinecap="round"/>
+                      </g>
+                    )}
+                  </g>
                 );
                 if (["rect","circle","triangle","arrow","arrowUp","star","diamond","line","dblArrow","callout","checkmark","cross"].includes(ann.type)) {
                   const sc = sel ? "#D81F3F" : (ann.strokeColor || "#000");
@@ -1873,8 +1984,9 @@ function PDFEditor({ pdfLib }) {
             {/* Resize handles overlay — INSIDE the relative canvas box so it aligns with the image */}
             {selected && (() => {
               const ann = pageAnnotations.find(a => a.id === selected);
-              // Photos and signatures are both stored as type "image" with w/h
-              const isResizable = ann?.type === "image" && ann?.src != null;
+              // Resizable: anything stored as a box (image, highlight, redact,
+              // shapes) — i.e. has numeric w/h and isn't free text or a path.
+              const isResizable = ann && typeof ann.w === "number" && typeof ann.h === "number" && ann.type !== "text" && ann.type !== "sign";
               if (!isResizable) return null;
               return (
                 <div style={{
@@ -1914,14 +2026,20 @@ function PDFEditor({ pdfLib }) {
                 ))}
               </div>
 
-              {/* Resize panel for selected image / signature */}
+              {/* Resize panel for the selected box annotation */}
               {(() => {
                 const selAnn = annotations.find(a => a.id === selected);
-                if (!selAnn || (selAnn.type !== "image")) return null;
+                const resizable = selAnn && typeof selAnn.w === "number" && typeof selAnn.h === "number" && selAnn.type !== "text" && selAnn.type !== "sign";
+                if (!resizable) return null;
+                const resizeLabel = selAnn.isSignature ? "Resize Signature"
+                  : selAnn.type === "image" ? "Resize Image"
+                  : selAnn.type === "highlight" ? "Resize Highlight"
+                  : selAnn.type === "redact" ? "Resize Redaction"
+                  : "Resize Shape";
                 return (
                   <div style={{ marginTop:"12px", padding:"12px 14px", background:"rgba(0,0,0,.03)", border:"1px solid rgba(0,0,0,.07)", borderRadius:"10px" }}>
                     <div style={{ fontSize:"10px", letterSpacing:".1em", color:selAnn.isSignature?"#D81F3F":"#2E7D5B", textTransform:"uppercase", marginBottom:"10px" }}>
-                      {selAnn.isSignature ? "Resize Signature" : "Resize Image"}
+                      {resizeLabel}
                     </div>
                     <div style={{ display:"flex", alignItems:"center", gap:"8px", flexWrap:"wrap" }}>
                       <label style={{ fontSize:"11px", color:"#8C8C88" }}>W</label>
@@ -1958,6 +2076,69 @@ function PDFEditor({ pdfLib }) {
               })()}
             </div>
           )}
+            </div>{/* end left column */}
+
+            {/* ── Comments / annotations panel (Adobe-style) ── */}
+            {(() => {
+              const all = annotations.filter(a => a.type === "highlight" || a.comment);
+              const q = commentSearch.trim().toLowerCase();
+              const items = all
+                .filter(a => !q || (a.comment||"").toLowerCase().includes(q))
+                .sort((a,b) => (a.page - b.page) || (a.y - b.y));
+              if (!showComments) return (
+                <button onClick={()=>setShowComments(true)} title="Show comments panel" style={{ flexShrink:0, writingMode:"vertical-rl", padding:"14px 9px", borderRadius:"10px", border:`1px solid ${T.border}`, background:T.surface, color:T.dim, cursor:"pointer", fontSize:"12px", fontWeight:600, fontFamily:T.ui }}>
+                  Comments{all.length?` (${all.length})`:""} ◂
+                </button>
+              );
+              return (
+                <aside style={{ width:"300px", flexShrink:0, background:T.surface, border:`1px solid ${T.border}`, borderRadius:"12px", display:"flex", flexDirection:"column", maxHeight:"calc(100vh - 210px)", overflow:"hidden" }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:"8px", padding:"12px 14px", borderBottom:`1px solid ${T.border}` }}>
+                    <span style={{ color:T.accent, display:"flex" }}><Icon name="marker" size={16}/></span>
+                    <div style={{ fontSize:"13px", fontWeight:600, color:T.text }}>Comments</div>
+                    <span style={{ fontSize:"11px", color:T.faint, fontFamily:T.mono }}>{all.length}</span>
+                    <button onClick={()=>setShowComments(false)} title="Hide panel" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="chevR" size={16}/></button>
+                  </div>
+                  <div style={{ padding:"10px 12px", borderBottom:`1px solid ${T.border}` }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:"7px", background:"rgba(0,0,0,.04)", border:`1px solid ${T.border}`, borderRadius:"8px", padding:"6px 10px" }}>
+                      <span style={{ color:T.faint, display:"flex" }}><Icon name="zoomIn" size={14}/></span>
+                      <input value={commentSearch} onChange={e=>setCommentSearch(e.target.value)} placeholder="Search notes…" style={{ flex:1, border:"none", background:"none", outline:"none", fontSize:"12px", color:T.text, fontFamily:T.ui }}/>
+                      {commentSearch && <button onClick={()=>setCommentSearch("")} style={{ background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={13}/></button>}
+                    </div>
+                  </div>
+                  <div style={{ overflowY:"auto", padding:"8px", display:"flex", flexDirection:"column", gap:"7px" }}>
+                    {items.length === 0 && (
+                      <div style={{ padding:"22px 12px", textAlign:"center", color:T.faintest, fontSize:"12px", lineHeight:1.6 }}>
+                        {all.length ? "No notes match your search." : "Use the Highlight tool, then add a note here. Click a note to jump to it."}
+                      </div>
+                    )}
+                    {items.map(a => {
+                      const sel = selected === a.id;
+                      const swatch = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : T.accent;
+                      return (
+                        <div key={a.id} style={{ border:`1px solid ${sel?T.accent:T.border}`, borderRadius:"9px", background: sel?"rgba(216,31,63,.05)":"rgba(0,0,0,.015)", overflow:"hidden" }}>
+                          <div onClick={()=>goToAnnotation(a)} style={{ display:"flex", alignItems:"center", gap:"8px", padding:"8px 10px", cursor:"pointer" }}>
+                            <span style={{ width:"13px", height:"13px", borderRadius:"3px", background:swatch, border:"1px solid rgba(0,0,0,.2)", flexShrink:0 }}/>
+                            <span style={{ fontSize:"11px", color:sel?T.accent:T.dim, fontWeight:600 }}>{a.type==="highlight"?"Highlight":a.type} · p.{a.page+1}</span>
+                            <button onClick={e=>{ e.stopPropagation(); pushHistory(annotations.filter(x=>x.id!==a.id)); if(selected===a.id) setSelected(null); }} title="Delete" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faintest, cursor:"pointer", display:"flex" }} onMouseEnter={e=>e.currentTarget.style.color=T.bad} onMouseLeave={e=>e.currentTarget.style.color=T.faintest}><Icon name="trash" size={13}/></button>
+                          </div>
+                          <textarea
+                            ref={el => { if (el) commentRefs.current[a.id] = el; }}
+                            defaultValue={a.comment || ""}
+                            onFocus={()=>setSelected(a.id)}
+                            onChange={e => setAnnotations(prev => prev.map(x => x.id===a.id ? {...x, comment:e.target.value} : x))}
+                            onBlur={() => { if (JSON.stringify(annotations) !== JSON.stringify(history[historyIdx])) pushHistory(annotations); }}
+                            placeholder="Add a note…"
+                            rows={2}
+                            style={{ width:"100%", border:"none", borderTop:`1px solid ${T.border}`, background:"transparent", padding:"8px 10px", fontSize:"12px", color:T.text, fontFamily:T.ui, outline:"none", resize:"vertical", lineHeight:1.5, boxSizing:"border-box" }}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </aside>
+              );
+            })()}
+          </div>{/* end canvas + panel row */}
         </div>
       )}
     </div>
