@@ -18,6 +18,7 @@ const EDIT_MODES = [
   { id: "image",     label: "Add Image",   icon: "image"  },
   { id: "redact",    label: "Wipe (Out)",  icon: "square" },
   { id: "highlight", label: "Highlight",   icon: "marker" },
+  { id: "note",      label: "Comment",     icon: "comment" },
   { id: "rect",      label: "Markers",     icon: "square" },
   { id: "sign",      label: "Signature",   icon: "pen"    },
   { id: "select",    label: "Select/Move", icon: "cursor" },
@@ -138,6 +139,7 @@ const ICON_PATHS = {
   lock:      '<rect x="5" y="11" width="14" height="9" rx="1.5"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/>',
   check:     '<path d="M5 12.5 10 17l9-10"/>',
   spinner:   '<path d="M12 3a9 9 0 1 0 9 9" />',
+  comment:   '<path d="M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-7l-4.5 4v-4H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M7.5 8.5h9M7.5 12h6"/>',
   zoomIn:    '<circle cx="11" cy="11" r="7"/><path d="M16 16l4 4M11 8v6M8 11h6"/>',
   zoomOut:   '<circle cx="11" cy="11" r="7"/><path d="M16 16l4 4M8 11h6"/>',
   type:      '<path d="M4 6V4.5h16V6"/><path d="M12 4.5v15"/><path d="M9 19.5h6"/>',
@@ -712,6 +714,42 @@ function formatNoteDate(d) {
   return dt.toLocaleString(undefined, { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 const MARKUP_SUBTYPES = ["Highlight", "Underline", "StrikeOut", "Squiggly"];
+// Sticky-note colours (Acrobat-like yellow first) and the on-screen icon size.
+const NOTE_COLORS = ["#FFD400", "#FF9F1C", "#4CC9F0", "#7BD389", "#FF6B9A", "#B388FF"];
+const STICKY_PX = 24;
+// Speech-bubble icon in a 24×24 box (also drawn into the PDF appearance stream).
+const BUBBLE_PATH = "M4 3h16a2.5 2.5 0 0 1 2.5 2.5v10A2.5 2.5 0 0 1 20 18h-8.5L6.5 22.5V18H4a2.5 2.5 0 0 1-2.5-2.5v-10A2.5 2.5 0 0 1 4 3Z";
+function shadeHex(hex, f) {            // f < 0 darkens, f > 0 lightens
+  const h = (hex || "#FFD400").replace("#", "");
+  const c = [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) || 0);
+  return "#" + c.map(v => Math.round(f < 0 ? v * (1 + f) : v + (255 - v) * f).toString(16).padStart(2, "0")).join("");
+}
+function bytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function dataUrlToBytes(url) {
+  const raw = atob(url.split(",")[1] || "");
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+// Identity of a note's image window (to detect edits that require rewriting it).
+function noteImageKey(a) {
+  const im = a && a.image;
+  return im ? [im.dx, im.dy, im.w, im.h, im.show, im.src.length, im.src.slice(-24)].join("|") : "";
+}
+// Any image → compact JPEG data URL (max 1400 px), plus its aspect ratio (h / w).
+async function prepareNoteImage(file) {
+  const url = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+  const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+  const k = Math.min(1, 1400 / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, w, h); x.drawImage(img, 0, 0, w, h);
+  return { src: c.toDataURL("image/jpeg", 0.9), aspect: h / w };
+}
 const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];   // Acrobat-like
 const ZOOM_MIN = 0.25, ZOOM_MAX = 4;
 const BADGE_DX = 18;   // comment marker: on-screen px to the right of the highlighted line's end
@@ -765,14 +803,38 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
           quads.push({ x: bx, y: by, w: Math.max(...xs) - bx, h: Math.max(...ys) - by });
         }
       } catch (_) {}
-      let color = null;
+      let color = null, hex = null;
       try {
         const c = d.lookup(PDFName.of("C"), PDFArray);
-        if (c && c.size() === 3) color = `rgba(${[0, 1, 2].map(k => Math.round(c.lookup(k).asNumber() * 255)).join(",")},0.45)`;
+        let rgb = null;
+        if (c && c.size() === 3) rgb = [0, 1, 2].map(k => c.lookup(k).asNumber());
+        else if (c && c.size() === 1) { const g = c.lookup(0).asNumber(); rgb = [g, g, g]; }
+        else if (c && c.size() === 4) { const [cc, m, yy, kk] = [0, 1, 2, 3].map(k => c.lookup(k).asNumber()); rgb = [cc, m, yy].map(v => (1 - v) * (1 - kk)); }
+        if (rgb) {
+          color = `rgba(${rgb.map(v => Math.round(v * 255)).join(",")},0.45)`;
+          hex = "#" + rgb.map(v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, "0")).join("");
+        }
       } catch (_) {}
+      // Image window of a sticky note written by this app: a Stamp grouped with
+      // the note (/IRT + /RT /Group), marked /PTNoteImage, image stored as JPEG.
+      const ptImage = !!d.get(PDFName.of("PTNoteImage"));
+      let imgSrc = null;
+      if (ptImage) {
+        try {
+          const ap = d.lookup(PDFName.of("AP"), PDFDict);
+          const n = ap && ap.lookup(PDFName.of("N"));
+          const res = n && n.dict && n.dict.lookup(PDFName.of("Resources"), PDFDict);
+          const xo = res && res.lookup(PDFName.of("XObject"), PDFDict);
+          if (xo) for (const [, v] of xo.entries()) {
+            const st = doc.context.lookup(v);
+            if (st && st.contents && String(st.dict.get(PDFName.of("Filter"))) === "/DCTDecode") { imgSrc = "data:image/jpeg;base64," + bytesToBase64(st.contents); break; }
+          }
+        } catch (_) {}
+      }
 
       raw.push({
-        i, key, sub, box, quads, color,
+        i, key, sub, box, quads, color, hex, ptImage, imgSrc,
+        rt: String(d.get(PDFName.of("RT")) || ""),
         text: (str("Contents") || "").replace(/\r\n?/g, "\n").trim(),
         author: str("T"), date: parsePdfDate(str("M") || str("CreationDate")),
         irt: refKey("IRT"), popup: refKey("Popup"), flags: num("F") || 0,
@@ -781,7 +843,14 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
       if (key) byRef.set(key, raw.length - 1);
     }
 
-    const skip = (a) => a.sub === "Popup" || a.sub === "Link" || a.sub === "Widget" || (a.flags & 2);   // 2 = Hidden
+    // Grouped image windows → attach to their sticky note (not shown as replies).
+    for (const a of raw) {
+      if (a.rt !== "/Group") continue;
+      a.grouped = true;
+      const root = a.irt && byRef.has(a.irt) ? raw[byRef.get(a.irt)] : null;
+      if (root && a.ptImage && a.imgSrc && a.box && root.box && !root.img) root.img = a;
+    }
+    const skip = (a) => a.grouped || a.sub === "Popup" || a.sub === "Link" || a.sub === "Widget" || (a.flags & 2);   // 2 = Hidden
     // A reply (/IRT) belongs to the root of its thread.
     const rootOf = (a) => { let cur = a, guard = 0; while (cur.irt && byRef.has(cur.irt) && guard++ < 50) cur = raw[byRef.get(cur.irt)]; return cur; };
     const replies = new Map();   // root raw idx → [raw]
@@ -799,7 +868,7 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
     raw.forEach((a, ri) => {
       if (skip(a) || isReply(a)) return;
       const thread = replies.get(ri) || [];
-      if (!a.text && !thread.length) return;           // nothing to show
+      if (!a.text && !thread.length && !a.img) return;   // nothing to show
       const g = a.box || (a.quads[0]) || { x: 0, y: 0, w: 0, h: 0 };
       const isMarkup = MARKUP_SUBTYPES.includes(a.sub) && a.quads.length;
       // Union of the quads (markup) or the Rect.
@@ -821,6 +890,20 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
       else if (a.sub === "Text") { bx = x + Math.min(w, 20) / 2; by = y + Math.min(h, 20) / 2; }
       else { bx = x + w; by = y; }
       const id = `pdfnote-${pageIdx}-${a.i}`;
+      if (a.sub === "Text" && a.box) {
+        // Sticky note → movable, recolourable, can carry an image window.
+        const im = a.img;
+        const sticky = {
+          id, page: pageIdx, type: "sticky", existing: true, annotIndex: a.i, popupIndex: popupIdx(a), pdfjsId: a.pdfjsId,
+          x: a.box.x, y: a.box.y, w: Math.max(a.box.w, 4), h: Math.max(a.box.h, 4),
+          color: a.hex || NOTE_COLORS[0], author: a.author, date: a.date ? a.date.getTime() : null,
+          comment: a.text, origComment: a.text,
+          image: im ? { src: im.imgSrc, dx: im.box.x - a.box.x, dy: im.box.y - a.box.y, w: im.box.w, h: im.box.h, show: !(im.flags & 2) } : null,
+          imgIndex: im ? im.i : null, imgPdfjsId: im ? im.pdfjsId : null,
+        };
+        sticky.origX = sticky.x; sticky.origY = sticky.y; sticky.origColor = sticky.color; sticky.origImgKey = noteImageKey(sticky);
+        out.push(sticky);
+      } else
       out.push({
         id, page: pageIdx, type: "note", existing: true, annotIndex: a.i, popupIndex: popupIdx(a), pdfjsId: a.pdfjsId,
         subtype: a.sub, x, y, w: Math.max(w, 4), h: Math.max(h, 4), quads: isMarkup ? a.quads : null, bx, by, bdx, bdy,
@@ -909,6 +992,31 @@ function PDFEditor({ pdfLib }) {
   const [commentPos, setCommentPos]       = useState({ left: 0, top: 0 });
   const commentInputRef = useRef(null);
   const panelListRef    = useRef(null);
+  // Sticky notes (Comment tool): colour of the next note, hover preview, image viewer, drag state
+  const [noteColor, setNoteColor] = useState(NOTE_COLORS[0]);
+  const [hoverNote, setHoverNote] = useState(null);        // {id, left, top}
+  const [lightbox, setLightbox]   = useState(null);        // image src shown full-size
+  const noteImageInputRef = useRef(null);
+  const noteDragRef       = useRef(null);
+  const popupRef          = useRef(null);
+  // The note popup can grow (an image loads, replies…): keep it fully on screen.
+  const clampPopup = () => {
+    const el = popupRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.bottom > window.innerHeight - 12) {
+      const top = Math.max(12, window.innerHeight - 12 - r.height);
+      setCommentPos(p => (Math.abs(p.top - top) > 1 ? { ...p, top } : p));
+    }
+  };
+  useLayoutEffect(clampPopup);
+  useEffect(() => {
+    const el = popupRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => clampPopup());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [activeComment]);
 
   // ── Coordinate model ──
   // Every annotation is stored in PAGE units: the pdf.js viewport at scale 1
@@ -924,7 +1032,9 @@ function PDFEditor({ pdfLib }) {
 
   // Where a note's marker sits, in page units.
   // dx = on-screen offset in px (marker drawn just right of the line end).
-  const noteAnchor = (ann) => ann.type === "note"
+  const noteAnchor = (ann) => ann.type === "sticky"
+    ? { x: ann.x, y: ann.y, dx: STICKY_PX / 2, dy: STICKY_PX / 2 }
+    : ann.type === "note"
     ? { x: ann.bx ?? ann.x, y: ann.by ?? ann.y, dx: ann.bdx || 0, dy: ann.bdy || 0 }
     : { x: (ann.x || 0) + (ann.w || 0), y: (ann.y || 0) + Math.min((ann.h || 0) / 2, 9), dx: BADGE_DX, dy: 0 };
 
@@ -941,7 +1051,7 @@ function PDFEditor({ pdfLib }) {
   // high-z-index card, so it is always on top of the PDF, never behind it.
   const placeCommentPopup = (ann) => {
     const rect = overlayRef.current?.getBoundingClientRect();
-    const POPW = 300, POPH = 240, M = 12;
+    const POPW = 300, POPH = popupRef.current?.offsetHeight || 240, M = 12;
     let left, top;
     if (rect && rect.width) {
       const k = pageBase ? rect.width / pageBase.w : scale;  // page units → screen px
@@ -981,6 +1091,12 @@ function PDFEditor({ pdfLib }) {
     }, ann.page !== currentPage ? 160 : 30);
   };
   const closeCommentPopup = () => {
+    const cur = annotations.find(x => x.id === activeComment);
+    if (cur && cur.type === "sticky" && !cur.existing && !(cur.comment || "").trim() && !cur.image) {
+      setActiveComment(null); setSelected(null);
+      pushHistory(annotations.filter(x => x.id !== cur.id));   // empty new note → discard
+      return;
+    }
     setActiveComment(null);
     // snapshot so the note is part of undo history
     if (JSON.stringify(annotations) !== JSON.stringify(history[historyIdx])) pushHistory(annotations);
@@ -1026,14 +1142,18 @@ function PDFEditor({ pdfLib }) {
     if (!doc || !doc.annotationStorage) return;
     const present = new Set(annotations.map(a => a.id));
     let changed = false;
+    const setHidden = (pid, hide) => {
+      if (!pid || hide === hiddenRef.current.has(pid)) return;
+      changed = true;
+      if (hide) hiddenRef.current.add(pid); else hiddenRef.current.delete(pid);
+      try { doc.annotationStorage.setValue(pid, { noView: hide }); } catch (_) {}
+    };
     for (const imp of importedRef.current) {
-      if (!imp.pdfjsId) continue;
-      const hide = !present.has(imp.id);
-      if (hide !== hiddenRef.current.has(imp.pdfjsId)) {
-        changed = true;
-        if (hide) hiddenRef.current.add(imp.pdfjsId); else hiddenRef.current.delete(imp.pdfjsId);
-        try { doc.annotationStorage.setValue(imp.pdfjsId, { noView: hide }); } catch (_) {}
-      }
+      // Sticky notes (and their image windows) are drawn by the app so they can
+      // be moved/recoloured; deleted notes disappear. Everything else: pdf.js.
+      const hide = !present.has(imp.id) || imp.kind === "sticky";
+      setHidden(imp.pdfjsId, hide);
+      setHidden(imp.imgPdfjsId, hide);
     }
     if (changed) setStorageVersion(v => v + 1);
   }, [annotations]);
@@ -1115,12 +1235,13 @@ function PDFEditor({ pdfLib }) {
       if (pdfJsDocRef.current && mod && e.key === "0") { e.preventDefault(); applyFit("fitPage"); }
       if (pdfJsDocRef.current && mod && e.key === "1") { e.preventDefault(); setZoomMode("custom"); zoomTo(1); }
       if (pdfJsDocRef.current && mod && e.key === "2") { e.preventDefault(); applyFit("fitWidth"); }
+      if (e.key === "Escape" && lightbox) { setLightbox(null); return; }
       if (e.key === "Escape" && activeComment != null) { closeCommentPopup(); return; }
       if ((e.key === "Delete" || e.key === "Backspace") && activeComment == null) { deleteSelected(); }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [historyIdx, history, selected, annotations, activeComment, scale, pageBase]);
+  }, [historyIdx, history, selected, annotations, activeComment, scale, pageBase, lightbox]);
 
   // Handle resize mouse movements
   useEffect(() => {
@@ -1245,7 +1366,7 @@ function PDFEditor({ pdfLib }) {
       try {
         existingNotes.push(...await readPdfNotes(pdfLib, doc, pdfJsDocRef.current));
       } catch (_) { /* annotations are optional — ignore read errors */ }
-      importedRef.current = existingNotes.map(n => ({ id:n.id, page:n.page, annotIndex:n.annotIndex, popupIndex:n.popupIndex, pdfjsId:n.pdfjsId }));
+      importedRef.current = existingNotes.map(n => ({ id:n.id, page:n.page, kind:n.type, annotIndex:n.annotIndex, popupIndex:n.popupIndex, pdfjsId:n.pdfjsId, imgIndex:n.imgIndex ?? null, imgPdfjsId:n.imgPdfjsId ?? null }));
       if (existingNotes.length) {
         setAnnotations(existingNotes);
         setHistory([existingNotes]);
@@ -1399,6 +1520,68 @@ function PDFEditor({ pdfLib }) {
     return () => el.removeEventListener("wheel", onWheel);
   });
 
+  // ── Sticky notes: drag to move (icon or its image window), hover preview, images ──
+  const pagePoint = (clientX, clientY) => {
+    const r = overlayRef.current.getBoundingClientRect();
+    const k = pageBase && r.width ? pageBase.w / r.width : 1 / scale;
+    return { x: (clientX - r.left) * k, y: (clientY - r.top) * k };
+  };
+  const startNoteDrag = (e, ann, part) => {
+    if (e.button !== 0) return;
+    e.stopPropagation(); e.preventDefault();
+    setHoverNote(null);
+    const p0 = pagePoint(e.clientX, e.clientY);
+    const st = { cx: e.clientX, cy: e.clientY, moved: false, base: annotations, last: null };
+    noteDragRef.current = st;
+    const maxX = (pageBase?.w || 600) - 4, maxY = (pageBase?.h || 800) - 4;
+    const move = (ev) => {
+      if (!st.moved && Math.hypot(ev.clientX - st.cx, ev.clientY - st.cy) < 4) return;
+      st.moved = true;
+      const p = pagePoint(ev.clientX, ev.clientY), dx = p.x - p0.x, dy = p.y - p0.y;
+      st.last = st.base.map(a => a.id !== ann.id ? a : part === "image"
+        ? { ...a, image: { ...a.image, dx: ann.image.dx + dx, dy: ann.image.dy + dy } }
+        : { ...a, x: Math.min(maxX, Math.max(0, ann.x + dx)), y: Math.min(maxY, Math.max(0, ann.y + dy)) });
+      setAnnotations(st.last);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      noteDragRef.current = null;
+      if (st.moved && st.last) { pushHistory(st.last); setSelected(ann.id); }
+      else if (part === "image") setLightbox(ann.image.src);
+      else openCommentPopup(ann);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+  const showHover = (ann, e) => {
+    if (activeComment != null || noteDragRef.current) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    let left = r.right + 10, top = r.top - 6;
+    if (left + 290 > window.innerWidth - 8) left = Math.max(8, r.left - 300);
+    if (top + 220 > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 228);
+    setHoverNote({ id: ann.id, left, top });
+  };
+  const hideHover = () => setHoverNote(null);
+  // Attach / replace the image of a sticky note (small window next to the note).
+  const attachNoteImage = async (id, file) => {
+    if (!file || !/^image\//.test(file.type || "")) return;
+    try {
+      const { src, aspect } = await prepareNoteImage(file);
+      setAnnotations(prev => prev.map(x => {
+        if (x.id !== id) return x;
+        let w = x.image ? x.image.w : 130, h = w * aspect;
+        if (h > 160) { h = 160; w = h / aspect; }
+        return { ...x, image: { src, dx: x.image ? x.image.dx : 30 / scale, dy: x.image ? x.image.dy : 0, w, h, show: x.image ? x.image.show : true } };
+      }));
+    } catch (_) { setError("Could not read that image."); }
+  };
+  const setNoteImageSize = (id, width) => setAnnotations(prev => prev.map(x => {
+    if (x.id !== id || !x.image) return x;
+    const aspect = x.image.h / x.image.w;
+    return { ...x, image: { ...x.image, w: width, h: width * aspect } };
+  }));
+
   // Mouse position in PAGE units (independent of zoom).
   const getCanvasPos = (e) => {
     const rect = overlayRef.current.getBoundingClientRect();
@@ -1424,6 +1607,15 @@ function PDFEditor({ pdfLib }) {
           dragOffRef.current = { x: pos.x - hit.x, y: pos.y - hit.y };
         }
       } else setSelected(null);
+      return;
+    }
+
+    if (editMode === "note") {
+      const k = 1 / scale;
+      const nn = { id: Date.now(), page: currentPage, type: "sticky", x: pos.x - (STICKY_PX / 2) * k, y: pos.y - (STICKY_PX / 2) * k,
+                   w: 20, h: 20, color: noteColor, comment: "", date: Date.now(), image: null };
+      pushHistory([...annotations, nn]);
+      openCommentPopup(nn);
       return;
     }
 
@@ -1679,6 +1871,52 @@ function PDFEditor({ pdfLib }) {
         return fontMap[key] || fontMap[fo.pdfLib] || fontMap["Helvetica"];
       };
 
+      // ── Sticky notes: icon appearance + image window (grouped Stamp) ──
+      const hex01 = (hex) => { const h = (hex || NOTE_COLORS[0]).replace("#", ""); return [0, 2, 4].map(i => (parseInt(h.substr(i, 2), 16) || 0) / 255); };
+      const formAP = (bbox, bytes, resources) => {
+        const fd = PDFDict.withContext(ctx);
+        fd.set(PDFName.of("Type"), PDFName.of("XObject"));
+        fd.set(PDFName.of("Subtype"), PDFName.of("Form"));
+        fd.set(PDFName.of("BBox"), numArr(bbox));
+        if (resources) fd.set(PDFName.of("Resources"), resources);
+        fd.set(PDFName.of("Length"), PDFNumber.of(bytes.length));
+        const n = PDFDict.withContext(ctx); n.set(PDFName.of("N"), ctx.register(PDFRawStream.of(fd, bytes)));
+        return n;
+      };
+      // 20×20 speech bubble with three text lines — same look as in the app.
+      const stickyAP = (color) => {
+        const [r, g, b] = hex01(color), f = (v) => v.toFixed(3);
+        const ops = `q ${f(r)} ${f(g)} ${f(b)} rg ${f(r*.5)} ${f(g*.5)} ${f(b*.5)} RG 1 w 1 j `
+          + `1.5 17 m 1.5 18.1 2.4 19 3.5 19 c 16.5 19 l 17.6 19 18.5 18.1 18.5 17 c 18.5 7.5 l 18.5 6.4 17.6 5.5 16.5 5.5 c `
+          + `9.5 5.5 l 5 1.5 l 5 5.5 l 3.5 5.5 l 2.4 5.5 1.5 6.4 1.5 7.5 c h B `
+          + `${f(r*.35)} ${f(g*.35)} ${f(b*.35)} RG 1.2 w 1 J 5 15 m 15 15 l S 5 12.3 m 15 12.3 l S 5 9.6 m 11 9.6 l S Q`;
+        return formAP([0, 0, 20, 20], new TextEncoder().encode(ops));
+      };
+      // The note's image window: a Stamp grouped with the note (/IRT + /RT /Group),
+      // so Acrobat moves/deletes them together; /PTNoteImage lets this app find it.
+      const addNoteImage = async (page, ann, noteRef) => {
+        const im = ann.image;
+        if (!im || !im.src) return;
+        const img = await doc.embedJpg(dataUrlToBytes(im.src));
+        const b = boxToPdf(ann.page, ann.x + im.dx, ann.y + im.dy, im.w, im.h);
+        const xo = PDFDict.withContext(ctx); xo.set(PDFName.of("Im0"), img.ref);
+        const res = PDFDict.withContext(ctx); res.set(PDFName.of("XObject"), xo);
+        const st = PDFDict.withContext(ctx);
+        st.set(PDFName.of("Type"), PDFName.of("Annot"));
+        st.set(PDFName.of("Subtype"), PDFName.of("Stamp"));
+        st.set(PDFName.of("Rect"), numArr([b.x, b.y, b.x + b.w, b.y + b.h]));
+        st.set(PDFName.of("F"), PDFNumber.of(im.show ? 4 : 6));          // print; + hidden when "Show on page" is off
+        st.set(PDFName.of("IRT"), noteRef);
+        st.set(PDFName.of("RT"), PDFName.of("Group"));
+        st.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+        st.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
+        st.set(PDFName.of("Contents"), PDFHexString.fromText("Image attached to a comment"));
+        st.set(PDFName.of("PTNoteImage"), PDFBool.True);
+        st.set(PDFName.of("AP"), formAP([0, 0, b.w, b.h], new TextEncoder().encode(`q ${b.w.toFixed(3)} 0 0 ${b.h.toFixed(3)} 0 0 cm /Im0 Do Q`), res));
+        page.node.addAnnot(ctx.register(st));
+      };
+      const rectOf = (ann) => { const b = boxToPdf(ann.page, ann.x, ann.y, ann.w, ann.h); return [b.x, b.y, b.x + b.w, b.y + b.h]; };
+
       // ── Imported notes: edit in place, delete removed ones ──
       // Each carries the exact /Annots index it was read from (in the original
       // file, which is re-loaded above), so the original annotation is updated
@@ -1689,15 +1927,37 @@ function PDFEditor({ pdfLib }) {
       const markRemove = (pi, idx) => { if (typeof idx !== "number") return; if (!removals.has(pi)) removals.set(pi, new Set()); removals.get(pi).add(idx); };
       for (const imp of importedRef.current) {
         const ann = present.get(imp.id);
-        if (!ann) { markRemove(imp.page, imp.annotIndex); markRemove(imp.page, imp.popupIndex); continue; }
+        if (!ann) { markRemove(imp.page, imp.annotIndex); markRemove(imp.page, imp.popupIndex); markRemove(imp.page, imp.imgIndex); continue; }
         const text = (ann.comment || "").trim();
-        if (text === (ann.origComment || "")) continue;
+        const textChanged = text !== (ann.origComment || "");
+        const isSticky = ann.type === "sticky";
+        const moved = isSticky && (Math.abs(ann.x - ann.origX) > 0.01 || Math.abs(ann.y - ann.origY) > 0.01);
+        const recolored = isSticky && ann.color !== ann.origColor;
+        const imgChanged = isSticky && (moved || noteImageKey(ann) !== ann.origImgKey);
+        if (!textChanged && !moved && !recolored && !imgChanged) continue;
         try {
           const annots = pages[imp.page].node.Annots && pages[imp.page].node.Annots();
           const d = annots && annots.lookup(imp.annotIndex, PDFDict);
           if (!d) continue;
-          if (text) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));
-          else d.delete(PDFName.of("Contents"));
+          if (textChanged) {
+            if (text) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));
+            else d.delete(PDFName.of("Contents"));
+          }
+          if (moved) {
+            // New position; its pop-up window moves by the same amount.
+            const o = d.lookup(PDFName.of("Rect"), PDFArray), nr = rectOf(ann);
+            const ox = o ? Math.min(o.lookup(0).asNumber(), o.lookup(2).asNumber()) : nr[0];
+            const oy = o ? Math.max(o.lookup(1).asNumber(), o.lookup(3).asNumber()) : nr[3];
+            d.set(PDFName.of("Rect"), numArr(nr));
+            const pd = typeof imp.popupIndex === "number" ? annots.lookup(imp.popupIndex, PDFDict) : null;
+            const pr = pd && pd.lookup(PDFName.of("Rect"), PDFArray);
+            if (pr) { const dx = nr[0] - ox, dy = nr[3] - oy; pd.set(PDFName.of("Rect"), numArr([0, 1, 2, 3].map(k => pr.lookup(k).asNumber() + (k % 2 ? dy : dx)))); }
+          }
+          if (recolored) { d.set(PDFName.of("C"), numArr(hex01(ann.color))); d.set(PDFName.of("AP"), stickyAP(ann.color)); }
+          if (imgChanged) {
+            markRemove(imp.page, imp.imgIndex);                      // old image window (if any)
+            if (ann.image) await addNoteImage(pages[imp.page], ann, annots.get(imp.annotIndex));
+          }
           d.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
         } catch (_) { /* leave the original untouched on any error */ }
       }
@@ -1713,7 +1973,7 @@ function PDFEditor({ pdfLib }) {
 
       for (const ann of annotations) {
         const page = pages[ann.page];
-        if (!page || ann.type === "reply" || ann.type === "note") continue;
+        if (!page || ann.type === "reply" || ann.type === "note" || ann.type === "sticky") continue;
         const P = (x, y) => toPdf(ann.page, x, y);
         const B = () => boxToPdf(ann.page, ann.x, ann.y, ann.w, ann.h);
 
@@ -1839,8 +2099,30 @@ function PDFEditor({ pdfLib }) {
 
       // Persist comments attached to non-highlight items (shapes, images, symbols)
       // as Adobe sticky-note annotations so they survive save/reopen too.
+      // New sticky notes → real Text annotations (+ image window), Adobe-compatible.
       for (const ann of annotations) {
-        if (ann.existing || ann.type === "highlight" || ann.type === "reply") continue;
+        if (ann.type !== "sticky" || ann.existing || !pages[ann.page]) continue;
+        try {
+          const t = PDFDict.withContext(ctx);
+          t.set(PDFName.of("Type"), PDFName.of("Annot"));
+          t.set(PDFName.of("Subtype"), PDFName.of("Text"));
+          t.set(PDFName.of("Name"), PDFName.of("Comment"));
+          t.set(PDFName.of("Rect"), numArr(rectOf({ ...ann, w: 20, h: 20 })));
+          t.set(PDFName.of("C"), numArr(hex01(ann.color)));
+          t.set(PDFName.of("F"), PDFNumber.of(28));                    // print + no-zoom + no-rotate (Acrobat's sticky-note flags)
+          t.set(PDFName.of("Open"), PDFBool.False);
+          t.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+          t.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
+          if ((ann.comment || "").trim()) t.set(PDFName.of("Contents"), PDFHexString.fromText(ann.comment.trim()));
+          t.set(PDFName.of("AP"), stickyAP(ann.color));
+          const ref = ctx.register(t);
+          pages[ann.page].node.addAnnot(ref);
+          await addNoteImage(pages[ann.page], ann, ref);
+        } catch (_) {}
+      }
+
+      for (const ann of annotations) {
+        if (ann.existing || ann.type === "highlight" || ann.type === "reply" || ann.type === "sticky") continue;
         if (ann.comment && ann.comment.trim()) {
           try { addTextNote(pages[ann.page], ann); } catch (_) {}
         }
@@ -1854,7 +2136,7 @@ function PDFEditor({ pdfLib }) {
     setSaving(false);
   };
 
-  const activeCursor = editMode === "select" ? "default" : editMode === "sign" ? "crosshair" : editMode === "addText" ? "text" : "crosshair";
+  const activeCursor = editMode === "select" ? "default" : editMode === "sign" ? "crosshair" : editMode === "addText" ? "text" : editMode === "note" ? "copy" : "crosshair";
   // 1 screen px expressed in page units — for UI chrome (markers, outlines)
   // that should keep a constant on-screen size at every zoom level.
   const ui = 1 / scale;
@@ -2303,6 +2585,7 @@ function PDFEditor({ pdfLib }) {
           <div style={{ fontSize:"11px", color:"#B6B5B0", fontStyle:"italic" }}>
             {editMode==="addText"   && "Click anywhere on the page to open the text editor"}
             {editMode==="redact"    && "Drag to draw a black redaction box (hides content permanently)"}
+            {editMode==="note"      && "Click on the page to add a comment (sticky note). Drag a note to move it; hover to read it; add an image inside the note."}
             {editMode==="highlight" && "Drag to highlight — then click the red note button on it (or double-click) to add a comment. Notes appear in the panel on the right."}
             {editMode==="rect"      && `Drag to draw a ${SHAPES.find(s=>s.id===shapeType)?.label||"shape"}`}
             {editMode==="sign"      && "Click anywhere on the page to open the signature drawing pad"}
@@ -2452,13 +2735,58 @@ function PDFEditor({ pdfLib }) {
                     </text>}
                   </g>
                 );
+                if (ann.type === "sticky") {
+                  // Sticky note: speech-bubble icon (constant on-screen size, like
+                  // Acrobat's NoZoom notes) + optional image window next to it.
+                  const im = ann.image;
+                  const nReplies = annotations.filter(r => r.parentId === ann.id).length;
+                  return (
+                    <g key={ann.id}>
+                      {im && im.show && (() => {
+                        const ix = ann.x + im.dx, iy = ann.y + im.dy;
+                        const cx = ann.x + (STICKY_PX / 2) * ui, cy = ann.y + (STICKY_PX / 2) * ui;
+                        const tx = Math.min(Math.max(cx, ix), ix + im.w), ty = Math.min(Math.max(cy, iy), iy + im.h);
+                        return (
+                          <g style={{ cursor:"grab" }} onMouseDown={(e)=>startNoteDrag(e, ann, "image")}
+                             onMouseEnter={(e)=>showHover(ann, e)} onMouseLeave={hideHover}>
+                            <line x1={cx} y1={cy} x2={tx} y2={ty} stroke={shadeHex(ann.color, -0.35)} strokeWidth={1.2*ui} strokeDasharray={`${3*ui},${2.5*ui}`}/>
+                            <rect x={ix - 3*ui} y={iy - 3*ui} width={im.w + 6*ui} height={im.h + 6*ui} rx={3*ui}
+                              fill="#fff" stroke={sel ? "#D81F3F" : shadeHex(ann.color, -0.25)} strokeWidth={(sel ? 2 : 1.5)*ui}/>
+                            <image href={im.src} x={ix} y={iy} width={im.w} height={im.h} preserveAspectRatio="xMidYMid meet"/>
+                          </g>
+                        );
+                      })()}
+                      <g transform={`translate(${ann.x} ${ann.y}) scale(${ui})`} style={{ cursor:"grab" }}
+                         onMouseDown={(e)=>startNoteDrag(e, ann, "icon")}
+                         onMouseEnter={(e)=>showHover(ann, e)} onMouseLeave={hideHover}>
+                        <rect x={-4} y={-4} width={STICKY_PX + 8} height={STICKY_PX + 8} fill="transparent"/>
+                        <path d={BUBBLE_PATH} transform="translate(1.2 1.6)" fill="rgba(0,0,0,.22)"/>
+                        <path d={BUBBLE_PATH} fill={ann.color} stroke={shadeHex(ann.color, -0.45)} strokeWidth={1.3} strokeLinejoin="round"/>
+                        <path d="M6.5 8h11M6.5 11.2h11M6.5 14.4h7" stroke={shadeHex(ann.color, -0.62)} strokeWidth={1.5} strokeLinecap="round" pointerEvents="none"/>
+                        {sel && <rect x={-3.5} y={-3.5} width={STICKY_PX + 7} height={STICKY_PX + 7} rx={6} fill="none" stroke="#D81F3F" strokeWidth={1.6} strokeDasharray="3.5,2.5"/>}
+                        {im && !im.show && (
+                          <g transform="translate(17 -3)" pointerEvents="none">
+                            <circle cx={5} cy={5} r={5.5} fill="#fff" stroke={shadeHex(ann.color, -0.45)} strokeWidth={1}/>
+                            <path d="M2.2 7.3 4.2 5l1.5 1.5L7 5.2l1.4 2.1Z" fill={shadeHex(ann.color, -0.5)}/>
+                          </g>
+                        )}
+                        {nReplies > 0 && (
+                          <g transform="translate(17 13)" pointerEvents="none">
+                            <circle cx={5} cy={5} r={5.6} fill="#D81F3F" stroke="#fff" strokeWidth={1.2}/>
+                            <text x={5} y={7.6} textAnchor="middle" fontSize={7.5} fontWeight={700} fill="#fff" fontFamily="sans-serif">{nReplies}</text>
+                          </g>
+                        )}
+                      </g>
+                    </g>
+                  );
+                }
                 if (ann.type === "note") {
                   // A note read from the PDF. The highlight itself is drawn by pdf.js
                   // on the canvas; here: a hit area over each highlighted line + marker.
                   const boxes = ann.quads && ann.quads.length ? ann.quads : [ann];
-                  const tip = [ann.author, ann.comment].filter(Boolean).join(": ");
                   return (
                     <g key={ann.id} style={{ cursor:"pointer" }} className="pdfnote"
+                       onMouseEnter={(e)=>showHover(ann, e)} onMouseLeave={hideHover}
                        onMouseDown={(e)=>e.stopPropagation()}
                        onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
                       {boxes.map((q, qi) => (
@@ -2467,7 +2795,6 @@ function PDFEditor({ pdfLib }) {
                           stroke={sel ? "#D81F3F" : "transparent"} strokeWidth={1.2*ui} strokeDasharray={`${4*ui},${3*ui}`}/>
                       ))}
                       {ann.comment || annotations.some(r => r.parentId === ann.id) ? noteBadge(ann.bx ?? ann.x, ann.by ?? ann.y, true, ann.bdx || 0, ann.bdy || 0) : null}
-                      <title>{tip || "Comment"}</title>
                     </g>
                   );
                 }
@@ -2482,6 +2809,7 @@ function PDFEditor({ pdfLib }) {
                         Shown when the highlight is selected or already has a note. */}
                     {(sel || ann.comment) && (
                       <g style={{ cursor:"pointer" }}
+                         onMouseEnter={(e)=>{ if (ann.comment) showHover(ann, e); }} onMouseLeave={hideHover}
                          onMouseDown={(e)=>e.stopPropagation()}
                          onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
                         {(() => { const a = noteAnchor(ann); return noteBadge(a.x, a.y, !!ann.comment, a.dx); })()}
@@ -2604,7 +2932,7 @@ function PDFEditor({ pdfLib }) {
               })}
 
               {/* Comment markers of shapes / images / symbols that carry a note */}
-              {pageAnnotations.filter(a => a.comment && a.type !== "note" && a.type !== "highlight" && typeof a.w === "number").map(a => (
+              {pageAnnotations.filter(a => a.comment && a.type !== "note" && a.type !== "sticky" && a.type !== "highlight" && typeof a.w === "number").map(a => (
                 <g key={"nb-"+a.id} style={{ cursor:"pointer" }}
                    onMouseDown={(e)=>e.stopPropagation()}
                    onClick={(e)=>{ e.stopPropagation(); openCommentPopup(a); }}>
@@ -2649,7 +2977,7 @@ function PDFEditor({ pdfLib }) {
               const ann = pageAnnotations.find(a => a.id === selected);
               // Resizable: anything stored as a box (image, highlight, redact,
               // shapes) — i.e. has numeric w/h and isn't free text or a path.
-              const isResizable = ann && !ann.existing && typeof ann.w === "number" && typeof ann.h === "number" && ann.type !== "text" && ann.type !== "sign" && ann.type !== "note";
+              const isResizable = ann && !ann.existing && typeof ann.w === "number" && typeof ann.h === "number" && ann.type !== "text" && ann.type !== "sign" && ann.type !== "note" && ann.type !== "sticky";
               if (!isResizable) return null;
               return (
                 <div style={{
@@ -2684,7 +3012,7 @@ function PDFEditor({ pdfLib }) {
                     background: selected===ann.id?"rgba(216,31,63,.1)":"rgba(0,0,0,.035)",
                     color: selected===ann.id?"#D81F3F":"#5C5C5A",
                   }}>
-                    {ann.type==="text" ? `T "${ann.text?.slice(0,18)||"…"}"` : ann.isSignature ? `signature` : ann.type==="image" ? `image` : ann.type==="note" ? `comment` : ann.type}
+                    {ann.type==="text" ? `T "${ann.text?.slice(0,18)||"…"}"` : ann.isSignature ? `signature` : ann.type==="image" ? `image` : (ann.type==="note" || ann.type==="sticky") ? `comment` : ann.type}
                   </div>
                 ))}
               </div>
@@ -2692,7 +3020,7 @@ function PDFEditor({ pdfLib }) {
               {/* Resize panel for the selected box annotation */}
               {(() => {
                 const selAnn = annotations.find(a => a.id === selected);
-                const resizable = selAnn && !selAnn.existing && typeof selAnn.w === "number" && typeof selAnn.h === "number" && selAnn.type !== "text" && selAnn.type !== "sign" && selAnn.type !== "note";
+                const resizable = selAnn && !selAnn.existing && typeof selAnn.w === "number" && typeof selAnn.h === "number" && selAnn.type !== "text" && selAnn.type !== "sign" && selAnn.type !== "note" && selAnn.type !== "sticky";
                 if (!resizable) return null;
                 const resizeLabel = selAnn.isSignature ? "Resize Signature"
                   : selAnn.type === "image" ? "Resize Image"
@@ -2744,14 +3072,14 @@ function PDFEditor({ pdfLib }) {
             {/* ── Comments panel (Acrobat-style): grouped by page, searchable, threaded ── */}
             {(() => {
               const repliesOf = (id) => annotations.filter(r => r.type === "reply" && r.parentId === id);
-              const all = annotations.filter(a => a.type !== "reply" && (a.type === "highlight" || a.type === "note" || (a.comment && a.comment.trim())));
+              const all = annotations.filter(a => a.type !== "reply" && (a.type === "highlight" || a.type === "note" || a.type === "sticky" || (a.comment && a.comment.trim())));
               const q = commentSearch.trim().toLowerCase();
               const hit = (a) => !q || [a.comment, a.author, ...repliesOf(a.id).flatMap(r => [r.comment, r.author])]
                 .some(s => (s || "").toLowerCase().includes(q));
               const items = all.filter(hit).sort((a,b) => (a.page - b.page) || ((a.by ?? a.y) - (b.by ?? b.y)) || (a.x - b.x));
               const groups = [];
               items.forEach(a => { const g = groups[groups.length-1]; if (g && g.page === a.page) g.items.push(a); else groups.push({ page:a.page, items:[a] }); });
-              const typeLabel = (a) => a.type === "highlight" ? "Highlight" : a.type !== "note" ? (a.type === "image" ? (a.isSymbol ? "Symbol" : "Image") : "Shape")
+              const typeLabel = (a) => a.type === "highlight" ? "Highlight" : a.type === "sticky" ? (a.image ? "Sticky note · image" : "Sticky note") : a.type !== "note" ? (a.type === "image" ? (a.isSymbol ? "Symbol" : "Image") : "Shape")
                 : ({ Highlight:"Highlight", Text:"Sticky note", FreeText:"Text box", Underline:"Underline", StrikeOut:"Strikethrough", Squiggly:"Squiggly", Square:"Rectangle", Circle:"Oval", Ink:"Drawing", Line:"Line", Polygon:"Polygon", PolyLine:"Polyline", Stamp:"Stamp", FileAttachment:"Attachment", Caret:"Insert text" }[a.subtype] || a.subtype || "Comment");
               const markText = (s) => {
                 if (!q || !s) return s;
@@ -2817,8 +3145,14 @@ function PDFEditor({ pdfLib }) {
                                 whiteSpace:"pre-wrap", wordBreak:"break-word",
                                 ...(sel ? {} : { display:"-webkit-box", WebkitLineClamp:4, WebkitBoxOrient:"vertical", overflow:"hidden" }),
                               }}>
-                                {a.comment ? markText(a.comment) : "Add a note…"}
+                                {a.comment ? markText(a.comment) : (a.image ? "" : "Add a note…")}
                               </div>
+                              {a.image && (
+                                <div style={{ margin:"0 10px 9px 39px" }}>
+                                  <img src={a.image.src} alt="" onClick={e=>{ e.stopPropagation(); setLightbox(a.image.src); }}
+                                    style={{ display:"block", maxWidth:"100%", maxHeight:"84px", borderRadius:"6px", border:`1px solid ${T.border}`, cursor:"zoom-in" }}/>
+                                </div>
+                              )}
                               {reps.length > 0 && (
                                 <div style={{ margin:"0 10px 9px 39px", paddingLeft:"9px", borderLeft:`2px solid ${T.border}`, display:"flex", flexDirection:"column", gap:"6px" }}>
                                   {reps.map(r => (
@@ -2851,16 +3185,31 @@ function PDFEditor({ pdfLib }) {
             const who = a.author || (a.existing ? "Unknown author" : "You");
             const setText = (id, v) => setAnnotations(prev => prev.map(x => x.id===id ? {...x, comment:v} : x));
             const keys = (e) => { if (e.key==="Escape") closeCommentPopup(); if (e.key==="Enter" && (e.ctrlKey||e.metaKey)) closeCommentPopup(); };
+            const isSticky = a.type === "sticky";
+            const patch = (fields) => setAnnotations(prev => prev.map(x => x.id===a.id ? { ...x, ...fields } : x));
+            // Paste (Ctrl+V) or drop an image straight into a sticky note.
+            const onPaste = (e) => {
+              if (!isSticky) return;
+              const f = [...(e.clipboardData?.files || [])].find(f => /^image\//.test(f.type));
+              if (f) { e.preventDefault(); attachNoteImage(a.id, f); }
+            };
+            const onDrop = (e) => {
+              if (!isSticky) return;
+              const f = [...(e.dataTransfer?.files || [])].find(f => /^image\//.test(f.type));
+              if (f) { e.preventDefault(); attachNoteImage(a.id, f); }
+            };
+            const chip = (on) => ({ padding:"4px 9px", borderRadius:"6px", border:`1px solid ${on ? T.accent : T.border}`, background: on ? T.accentBg : "#fff", color: on ? T.accent : T.dim, cursor:"pointer", fontSize:"11.5px", fontFamily:T.ui });
             const ta = { width:"100%", border:`1px solid ${T.border}`, borderRadius:"8px", background:"#fff", padding:"8px 10px", fontSize:"13px", color:T.text, fontFamily:T.ui, outline:"none", resize:"vertical", lineHeight:1.5, boxSizing:"border-box" };
             return (
               <>
                 <div onMouseDown={closeCommentPopup} style={{ position:"fixed", inset:0, zIndex:1190, background:"transparent" }}/>
-                <div onMouseDown={e=>e.stopPropagation()} style={{ position:"fixed", left:commentPos.left+"px", top:commentPos.top+"px", zIndex:1200, width:"300px", maxHeight:"calc(100vh - 24px)", display:"flex", flexDirection:"column", background:"#fff", border:`1px solid ${T.borderUp}`, borderTop:`4px solid ${bar.replace(/,\s*0?\.\d+\)$/, ",0.95)")}`, borderRadius:"12px", boxShadow:"0 16px 44px rgba(0,0,0,.26)", overflow:"hidden", animation:"fadeIn .12s" }}>
+                <div ref={popupRef} onMouseDown={e=>e.stopPropagation()} onPaste={onPaste} onDragOver={e=>{ if (isSticky) e.preventDefault(); }} onDrop={onDrop}
+                  style={{ position:"fixed", left:commentPos.left+"px", top:commentPos.top+"px", zIndex:1200, width:"300px", maxHeight:"calc(100vh - 24px)", display:"flex", flexDirection:"column", background:"#fff", border:`1px solid ${T.borderUp}`, borderTop:`4px solid ${bar.replace(/,\s*0?\.\d+\)$/, ",0.95)")}`, borderRadius:"12px", boxShadow:"0 16px 44px rgba(0,0,0,.26)", overflow:"hidden", animation:"fadeIn .12s" }}>
                   <div style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"8px", padding:"9px 12px", borderBottom:`1px solid ${T.border}`, background:"rgba(0,0,0,.02)" }}>
                     <span style={{ width:"22px", height:"22px", borderRadius:"50%", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(216,31,63,.10)", color:T.accent, fontSize:"10.5px", fontWeight:700 }}>{(who.trim()[0] || "?").toUpperCase()}</span>
                     <div style={{ minWidth:0, flex:1 }}>
                       <div style={{ fontSize:"12.5px", fontWeight:600, color:T.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{who}</div>
-                      <div style={{ fontSize:"10.5px", color:T.faint }}>Page {a.page+1}{a.date ? " · " + formatNoteDate(a.date) : ""}</div>
+                      <div style={{ fontSize:"10.5px", color:T.faint }}>{isSticky ? "Sticky note · " : ""}Page {a.page+1}{a.date ? " · " + formatNoteDate(a.date) : ""}</div>
                     </div>
                     <button onClick={closeCommentPopup} title="Close (Esc)" style={{ background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={15}/></button>
                   </div>
@@ -2872,7 +3221,50 @@ function PDFEditor({ pdfLib }) {
                       </div>
                     ) : (
                       <textarea ref={commentInputRef} value={a.comment || ""} onChange={e => setText(a.id, e.target.value)} onKeyDown={keys}
-                        placeholder="Write a note…" rows={Math.min(8, Math.max(3, ((a.comment||"").match(/\n/g)||[]).length + 2))} style={ta}/>
+                        placeholder={isSticky ? "Write a comment… (you can paste an image too)" : "Write a note…"}
+                        rows={Math.min(8, Math.max(3, ((a.comment||"").match(/\n/g)||[]).length + 2))}
+                        style={isSticky ? { ...ta, background: shadeHex(a.color, 0.85), borderColor: shadeHex(a.color, -0.1) } : ta}/>
+                    )}
+                    {isSticky && (
+                      <>
+                        {/* Colour */}
+                        <div style={{ display:"flex", alignItems:"center", gap:"7px" }}>
+                          <span style={{ fontSize:"11px", color:T.faint, width:"40px" }}>Colour</span>
+                          {NOTE_COLORS.map(c => (
+                            <button key={c} onClick={() => { patch({ color:c }); setNoteColor(c); }} title={c}
+                              style={{ width:"19px", height:"19px", borderRadius:"50%", background:c, cursor:"pointer", padding:0,
+                                border: a.color === c ? `2px solid ${shadeHex(c, -0.55)}` : "1px solid rgba(0,0,0,.18)", boxShadow: a.color === c ? "0 0 0 2px #fff inset" : "none" }}/>
+                          ))}
+                        </div>
+                        {/* Image window */}
+                        <input ref={noteImageInputRef} type="file" accept="image/*" style={{ display:"none" }}
+                          onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ""; attachNoteImage(a.id, f); }}/>
+                        {a.image ? (
+                          <div style={{ border:`1px solid ${T.border}`, borderRadius:"10px", padding:"8px", background:"rgba(0,0,0,.02)", display:"flex", flexDirection:"column", gap:"8px" }}>
+                            <img src={a.image.src} alt="" onClick={() => setLightbox(a.image.src)} title="Click to enlarge"
+                              style={{ display:"block", maxWidth:"100%", maxHeight:"150px", margin:"0 auto", borderRadius:"6px", cursor:"zoom-in", boxShadow:"0 1px 3px rgba(0,0,0,.15)" }}/>
+                            <div style={{ display:"flex", alignItems:"center", gap:"5px", flexWrap:"wrap" }}>
+                              <span style={{ fontSize:"11px", color:T.faint, marginRight:"2px" }}>Size</span>
+                              {[["S",80],["M",130],["L",200]].map(([l,w]) => (
+                                <button key={l} onClick={() => setNoteImageSize(a.id, w)} style={chip(Math.abs(a.image.w - w) < 1)}>{l}</button>
+                              ))}
+                              <label style={{ display:"flex", alignItems:"center", gap:"4px", fontSize:"11.5px", color:T.dim, marginLeft:"auto", cursor:"pointer" }}>
+                                <input type="checkbox" checked={!!a.image.show} onChange={e => patch({ image: { ...a.image, show: e.target.checked } })} style={{ accentColor:T.accent }}/>
+                                Show on page
+                              </label>
+                            </div>
+                            <div style={{ display:"flex", gap:"6px" }}>
+                              <button onClick={() => noteImageInputRef.current?.click()} style={chip(false)}>Replace…</button>
+                              <button onClick={() => patch({ image: null })} style={{ ...chip(false), color:T.bad }}>Remove image</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button onClick={() => noteImageInputRef.current?.click()}
+                            style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"7px", padding:"9px", borderRadius:"9px", border:`1.5px dashed ${T.borderUp}`, background:"rgba(0,0,0,.015)", color:T.dim, cursor:"pointer", fontSize:"12px", fontFamily:T.ui }}>
+                            <Icon name="image" size={15}/>Add image <span style={{ color:T.faintest, fontSize:"11px" }}>— or paste / drop one</span>
+                          </button>
+                        )}
+                      </>
                     )}
                     {reps.length > 0 && (
                       <div style={{ display:"flex", flexDirection:"column", gap:"8px", paddingLeft:"10px", borderLeft:`2px solid ${T.border}` }}>
@@ -2895,6 +3287,34 @@ function PDFEditor({ pdfLib }) {
               </>
             );
           })()}
+
+          {/* ── Hover preview: read a comment without opening it (Acrobat-like) ── */}
+          {hoverNote && activeComment == null && (() => {
+            const a = annotations.find(x => x.id === hoverNote.id);
+            if (!a) return null;
+            const reps = annotations.filter(r => r.type === "reply" && r.parentId === a.id);
+            const who = a.author || (a.existing ? "Unknown author" : "You");
+            const col = a.type === "sticky" ? a.color : a.type === "highlight" ? (a.color || "rgba(255,230,0,.45)").replace(/,\s*0?\.\d+\)$/, ",0.95)") : "#D81F3F";
+            return (
+              <div style={{ position:"fixed", left:hoverNote.left+"px", top:hoverNote.top+"px", zIndex:1150, width:"280px", pointerEvents:"none",
+                background: a.type === "sticky" ? shadeHex(a.color, 0.88) : "#fff", border:`1px solid ${T.borderUp}`, borderTop:`3px solid ${col}`,
+                borderRadius:"10px", boxShadow:"0 10px 28px rgba(0,0,0,.20)", padding:"9px 12px", animation:"fadeIn .1s" }}>
+                <div style={{ fontSize:"11.5px", color:T.dim, marginBottom:"5px" }}><b style={{ color:T.text }}>{who}</b>{a.date ? " · " + formatNoteDate(a.date) : ""}</div>
+                {a.comment ? (
+                  <div style={{ fontSize:"13px", lineHeight:1.5, color:T.text, whiteSpace:"pre-wrap", wordBreak:"break-word", display:"-webkit-box", WebkitLineClamp:9, WebkitBoxOrient:"vertical", overflow:"hidden" }}>{a.comment}</div>
+                ) : !a.image ? <div style={{ fontSize:"12px", color:T.faintest, fontStyle:"italic" }}>Empty note — click to write</div> : null}
+                {a.image && <img src={a.image.src} alt="" style={{ display:"block", maxWidth:"100%", maxHeight:"120px", marginTop: a.comment ? "8px" : 0, borderRadius:"6px", border:`1px solid ${T.border}` }}/>}
+                {reps.length > 0 && <div style={{ marginTop:"6px", fontSize:"11px", color:T.faint }}>{reps.length} repl{reps.length === 1 ? "y" : "ies"} · click to open</div>}
+              </div>
+            );
+          })()}
+
+          {/* ── Image viewer for note images ── */}
+          {lightbox && (
+            <div onClick={() => setLightbox(null)} style={{ position:"fixed", inset:0, zIndex:1300, background:"rgba(20,20,22,.72)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"zoom-out", animation:"fadeIn .12s" }}>
+              <img src={lightbox} alt="" style={{ maxWidth:"92vw", maxHeight:"90vh", borderRadius:"8px", boxShadow:"0 20px 60px rgba(0,0,0,.5)", background:"#fff" }}/>
+            </div>
+          )}
         </div>
       )}
     </div>
