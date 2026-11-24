@@ -949,12 +949,15 @@ function PDFEditor({ pdfLib }) {
           const vp = pg.getViewport({ scale });
           const anns = await pg.getAnnotations();
           anns.forEach((an, i) => {
-            const text = (an.contents || "").trim();
+            // pdf.js exposes the note text as `contentsObj.str` (newer builds)
+            // or `contents` (older). Adobe stores a highlight's note here too.
+            const text = ((an.contentsObj && an.contentsObj.str) || an.contents || "").trim();
             if (!text) return;   // only annotations that actually carry a note
+            const author = (an.titleObj && an.titleObj.str) || an.title || "";
             const r = an.rect ? vp.convertToViewportRectangle(an.rect) : [0, 0, 0, 0];
             const x = Math.min(r[0], r[2]), y = Math.min(r[1], r[3]);
             const w = Math.max(10, Math.abs(r[2] - r[0])), h = Math.max(10, Math.abs(r[3] - r[1]));
-            existingNotes.push({ id:`pdfnote-${p}-${i}`, page:p-1, type:"note", existing:true, x, y, w, h, comment:text, subtype:an.subtype || "Note" });
+            existingNotes.push({ id:`pdfnote-${p}-${i}`, page:p-1, type:"note", existing:true, x, y, w, h, comment:text, author, subtype:an.subtype || "Note" });
           });
         }
       } catch (_) { /* annotations are optional — ignore read errors */ }
@@ -1171,15 +1174,76 @@ function PDFEditor({ pdfLib }) {
     if (!pdfDoc) return;
     setSaving(true);
     try {
-      const { rgb, StandardFonts } = pdfLib;
+      const { rgb, StandardFonts, PDFName, PDFNumber, PDFArray, PDFDict, PDFHexString, PDFRawStream, PDFBool } = pdfLib;
       const doc   = pdfDoc;
       const pages = doc.getPages();
+      const ctx   = doc.context;
 
       const hexToRgb = hex => {
         const r = parseInt(hex.slice(1,3),16)/255;
         const g = parseInt(hex.slice(3,5),16)/255;
         const b = parseInt(hex.slice(5,7),16)/255;
         return rgb(r,g,b);
+      };
+
+      // ── Real PDF annotations (Adobe-compatible) ──
+      const numArr = (nums) => { const a = PDFArray.withContext(ctx); nums.forEach(n => a.push(PDFNumber.of(n))); return a; };
+      // A Highlight markup annotation with QuadPoints, colour, an appearance
+      // stream (so every viewer renders it) and the note in /Contents.
+      const addHighlightAnnot = (page, ann) => {
+        const { height } = page.getSize();
+        const x1 = ann.x / scale, x2 = (ann.x + ann.w) / scale;
+        const y2 = height - ann.y / scale, y1 = height - (ann.y + ann.h) / scale;
+        const w = Math.max(1, x2 - x1), h = Math.max(1, y2 - y1);
+        const m = (ann.color || "rgba(255,230,0,0.45)").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+        const cr = m ? +m[1]/255 : 1, cg = m ? +m[2]/255 : 0.9, cb = m ? +m[3]/255 : 0;
+        const ca = m && m[4] ? +m[4] : 0.4;
+        // ExtGState (Multiply blend + opacity) + appearance form XObject
+        const gs = PDFDict.withContext(ctx);
+        gs.set(PDFName.of("Type"), PDFName.of("ExtGState"));
+        gs.set(PDFName.of("BM"), PDFName.of("Multiply"));
+        gs.set(PDFName.of("ca"), PDFNumber.of(ca));
+        const gsRef = ctx.register(gs);
+        const extg = PDFDict.withContext(ctx); extg.set(PDFName.of("GS"), gsRef);
+        const res = PDFDict.withContext(ctx); res.set(PDFName.of("ExtGState"), extg);
+        const apDict = PDFDict.withContext(ctx);
+        apDict.set(PDFName.of("Type"), PDFName.of("XObject"));
+        apDict.set(PDFName.of("Subtype"), PDFName.of("Form"));
+        apDict.set(PDFName.of("FormType"), PDFNumber.of(1));
+        apDict.set(PDFName.of("BBox"), numArr([0, 0, w, h]));
+        apDict.set(PDFName.of("Resources"), res);
+        const apBytes = new TextEncoder().encode(`/GS gs ${cr.toFixed(4)} ${cg.toFixed(4)} ${cb.toFixed(4)} rg 0 0 ${w.toFixed(2)} ${h.toFixed(2)} re f`);
+        apDict.set(PDFName.of("Length"), PDFNumber.of(apBytes.length));
+        const apRef = ctx.register(PDFRawStream.of(apDict, apBytes));
+        const apN = PDFDict.withContext(ctx); apN.set(PDFName.of("N"), apRef);
+
+        const annot = PDFDict.withContext(ctx);
+        annot.set(PDFName.of("Type"), PDFName.of("Annot"));
+        annot.set(PDFName.of("Subtype"), PDFName.of("Highlight"));
+        annot.set(PDFName.of("Rect"), numArr([x1, y1, x2, y2]));
+        annot.set(PDFName.of("QuadPoints"), numArr([x1, y2, x2, y2, x1, y1, x2, y1]));
+        annot.set(PDFName.of("C"), numArr([cr, cg, cb]));
+        annot.set(PDFName.of("CA"), PDFNumber.of(ca));
+        annot.set(PDFName.of("F"), PDFNumber.of(4));
+        annot.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+        if (ann.comment) annot.set(PDFName.of("Contents"), PDFHexString.fromText(ann.comment));
+        annot.set(PDFName.of("AP"), apN);
+        page.node.addAnnot(ctx.register(annot));
+      };
+      // A Text (sticky-note) annotation carrying a comment on a non-highlight item.
+      const addTextNote = (page, ann) => {
+        const { height } = page.getSize();
+        const x = ann.x / scale, y = height - ann.y / scale;
+        const annot = PDFDict.withContext(ctx);
+        annot.set(PDFName.of("Type"), PDFName.of("Annot"));
+        annot.set(PDFName.of("Subtype"), PDFName.of("Text"));
+        annot.set(PDFName.of("Name"), PDFName.of("Comment"));
+        annot.set(PDFName.of("Rect"), numArr([x, y - 20, x + 20, y]));
+        annot.set(PDFName.of("F"), PDFNumber.of(4));
+        annot.set(PDFName.of("Open"), PDFBool.False);
+        annot.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+        annot.set(PDFName.of("Contents"), PDFHexString.fromText(ann.comment || ""));
+        page.node.addAnnot(ctx.register(annot));
       };
 
       // embed fonts once
@@ -1229,15 +1293,11 @@ function PDFEditor({ pdfLib }) {
           const rc = ann.color === "white" ? rgb(1,1,1) : rgb(0,0,0);
           page.drawRectangle({ x: ann.x/scale, y: pdfY(ann.y+ann.h), width: ann.w/scale, height: ann.h/scale, color: rc });
         }
+        if (ann.existing) continue;   // already in the PDF (pdf-lib preserves it) — don't duplicate
         if (ann.type === "highlight") {
-          // Parse rgba color stored on annotation
-          const hc = ann.color || "rgba(255,230,0,0.45)";
-          const m = hc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-          const hr = m ? parseInt(m[1])/255 : 1;
-          const hg = m ? parseInt(m[2])/255 : 0.9;
-          const hb = m ? parseInt(m[3])/255 : 0;
-          const ha = m && m[4] ? parseFloat(m[4]) : 0.4;
-          page.drawRectangle({ x: ann.x/scale, y: pdfY(ann.y+ann.h), width: ann.w/scale, height: ann.h/scale, color: rgb(hr,hg,hb), opacity: ha });
+          // Save as a real, Adobe-compatible Highlight annotation (with its note),
+          // not a baked-in rectangle — so the note survives save/reopen.
+          addHighlightAnnot(page, ann);
         }
         if (["rect","circle","triangle","arrow","arrowUp","star","diamond","line","dblArrow","callout","checkmark","cross"].includes(ann.type)) {
           const shSc = hexToRgb(ann.strokeColor || "#000000");
@@ -1325,6 +1385,15 @@ function PDFEditor({ pdfLib }) {
               height: ann.h / scale,
             });
           } catch (_) { /* skip unembeddable images */ }
+        }
+      }
+
+      // Persist comments attached to non-highlight items (shapes, images, symbols)
+      // as Adobe sticky-note annotations so they survive save/reopen too.
+      for (const ann of annotations) {
+        if (ann.existing || ann.type === "highlight") continue;
+        if (ann.comment && ann.comment.trim()) {
+          try { addTextNote(pages[ann.page], ann); } catch (_) {}
         }
       }
 
@@ -1881,8 +1950,10 @@ function PDFEditor({ pdfLib }) {
                   <g key={ann.id} style={{ cursor:"pointer" }}
                      onMouseDown={(e)=>e.stopPropagation()}
                      onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
-                    <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h}
-                      fill="rgba(216,31,63,.06)" stroke="rgba(216,31,63,.55)" strokeWidth={1} strokeDasharray="4,3" rx={2}/>
+                    {/* transparent hit area over the annotated region */}
+                    <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h} fill="transparent"
+                      stroke={sel ? "#D81F3F" : "transparent"} strokeWidth={1.2} strokeDasharray="4,3"/>
+                    {/* comment icon badge */}
                     <circle cx={ann.x} cy={ann.y} r={8.5} fill="#D81F3F" stroke="#fff" strokeWidth={1.5}/>
                     <path d={`M${ann.x-4},${ann.y-2.2} h8 M${ann.x-4},${ann.y+0.6} h8 M${ann.x-4},${ann.y+3.4} h5`} stroke="#fff" strokeWidth={1.1} strokeLinecap="round"/>
                     <title>{ann.comment}</title>
