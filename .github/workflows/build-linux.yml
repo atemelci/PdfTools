@@ -64,4 +64,3 @@ jobs:
           files: |
             release/*.AppImage
             release/*.deb
-          generate_release_notes: true

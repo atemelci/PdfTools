@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useLayoutEffect } from "react";
 
 const SIDEBAR_TOOLS = [
   { id: "editor",    label: "PDF Editor",   icon: "editor",    section: "Tools", desc: "Add text, shapes & redact visually" },
@@ -124,6 +124,7 @@ const ICON_PATHS = {
   extract:   '<path d="M13 3H6.5A1.5 1.5 0 0 0 5 4.5v15A1.5 1.5 0 0 0 6.5 21h11a1.5 1.5 0 0 0 1.5-1.5V9Z"/><path d="M13 3v6h6"/><path d="M9 13h6M9 16.5h4"/>',
   chevL:     '<path d="M14.5 18 8.5 12l6-6"/>',
   chevR:     '<path d="M9.5 6 15.5 12l-6 6"/>',
+  chevD:     '<path d="M6 9.5 12 15.5l6-6"/>',
   download:  '<path d="M12 4v11"/><path d="M7.5 10.5 12 15l4.5-4.5"/><path d="M5 20h14"/>',
   close:     '<path d="M6 6l12 12M18 6 6 18"/>',
   alert:     '<path d="M12 4 21 19H3Z"/><path d="M12 10v4"/><path d="M12 17h0"/>',
@@ -657,6 +658,40 @@ function SignatureModal({ onConfirm, onCancel }) {
 }
 
 /* ══════════════════════════════════════════
+   SMALL SHARED HELPERS
+══════════════════════════════════════════ */
+// Readable error for the common "protected PDF" case instead of pdf-lib's internals.
+function friendlyPdfError(e, prefix = "Error: ") {
+  const m = (e && e.message) || String(e);
+  if (/encrypt/i.test(m)) return "This PDF is protected (encrypted). Remove the protection first (e.g. print it to a new PDF, or use \"Save as\" without security in your PDF reader), then try again.";
+  if (/password/i.test(m)) return "This PDF needs a password to open. Remove the password first, then try again.";
+  return prefix + m;
+}
+// EXIF orientation (1–8) of a JPEG, or 1 when absent.
+function jpegOrientation(bytes) {
+  try {
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (v.getUint16(0) !== 0xFFD8) return 1;
+    let off = 2;
+    while (off + 4 < v.byteLength) {
+      const marker = v.getUint16(off), len = v.getUint16(off + 2);
+      if (marker === 0xFFE1 && v.getUint32(off + 4) === 0x45786966) {        // "Exif"
+        const t = off + 10, le = v.getUint16(t) === 0x4949;
+        const ifd = t + v.getUint32(t + 4, le), n = v.getUint16(ifd, le);
+        for (let i = 0; i < n; i++) {
+          const e = ifd + 2 + i * 12;
+          if (v.getUint16(e, le) === 0x0112) return v.getUint16(e + 8, le);
+        }
+        return 1;
+      }
+      if ((marker & 0xFF00) !== 0xFF00 || marker === 0xFFDA) break;           // start of scan: no EXIF
+      off += 2 + len;
+    }
+  } catch (_) {}
+  return 1;
+}
+
+/* ══════════════════════════════════════════
    PDF ANNOTATION (COMMENT) HELPERS
 ══════════════════════════════════════════ */
 // "D:20240115103000+03'00'" → Date (or null)
@@ -677,6 +712,8 @@ function formatNoteDate(d) {
   return dt.toLocaleString(undefined, { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 const MARKUP_SUBTYPES = ["Highlight", "Underline", "StrikeOut", "Squiggly"];
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];   // Acrobat-like
+const ZOOM_MIN = 0.25, ZOOM_MAX = 4;
 const BADGE_DX = 18;   // comment marker: on-screen px to the right of the highlighted line's end
 
 // Read every annotation that carries a note (or has replies) from a pdf-lib
@@ -811,7 +848,10 @@ function PDFEditor({ pdfLib }) {
   const [pageCount, setPageCount]     = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
   const [docVersion, setDocVersion]   = useState(0);   // bumped each time a new PDF is loaded, forces a re-render of the canvas
-  const [scale, setScale]             = useState(1.2);
+  const [scale, setScale]             = useState(1.25);
+  const [zoomMode, setZoomMode]       = useState("custom");   // "custom" | "fitWidth" | "fitPage"
+  const [showZoomMenu, setShowZoomMenu] = useState(false);
+  const [zoomText, setZoomText]       = useState(null);       // zoom % being typed, or null
   const [editMode, setEditMode]       = useState("addText");
   const [annotations, setAnnotations] = useState([]);
   const [history, setHistory]         = useState([[]]); // stack of annotation snapshots
@@ -892,7 +932,7 @@ function PDFEditor({ pdfLib }) {
   const getScrollParent = (el) => {
     for (let p = el?.parentElement; p; p = p.parentElement) {
       const s = getComputedStyle(p);
-      if (/(auto|scroll)/.test(s.overflowY + s.overflow) && p.scrollHeight > p.clientHeight + 1) return p;
+      if (/(auto|scroll)/.test(s.overflowY) && p.scrollHeight > p.clientHeight + 1) return p;
     }
     return null;
   };
@@ -1066,13 +1106,21 @@ function PDFEditor({ pdfLib }) {
     const handleKey = (e) => {
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return; // don't intercept typing
-      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
-      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); }
-      if (e.key === "Delete" || e.key === "Backspace") { deleteSelected(); }
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      if (mod && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); }
+      // Acrobat zoom shortcuts: Ctrl +/-, Ctrl+0 fit page, Ctrl+1 actual size, Ctrl+2 fit width
+      if (pdfJsDocRef.current && mod && (e.key === "=" || e.key === "+")) { e.preventDefault(); zoomStep(1); }
+      if (pdfJsDocRef.current && mod && e.key === "-") { e.preventDefault(); zoomStep(-1); }
+      if (pdfJsDocRef.current && mod && e.key === "0") { e.preventDefault(); applyFit("fitPage"); }
+      if (pdfJsDocRef.current && mod && e.key === "1") { e.preventDefault(); setZoomMode("custom"); zoomTo(1); }
+      if (pdfJsDocRef.current && mod && e.key === "2") { e.preventDefault(); applyFit("fitWidth"); }
+      if (e.key === "Escape" && activeComment != null) { closeCommentPopup(); return; }
+      if ((e.key === "Delete" || e.key === "Backspace") && activeComment == null) { deleteSelected(); }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [historyIdx, history, selected, annotations]);
+  }, [historyIdx, history, selected, annotations, activeComment, scale, pageBase]);
 
   // Handle resize mouse movements
   useEffect(() => {
@@ -1207,7 +1255,7 @@ function PDFEditor({ pdfLib }) {
 
       setCurrentPage(0);
       setDocVersion(v => v + 1);   // guarantees the render effect runs even if currentPage was already 0
-    } catch (e) { setError("Could not load PDF: " + e.message); }
+    } catch (e) { setError(friendlyPdfError(e, "Could not load PDF: ")); }
     setLoading(false);
   };
 
@@ -1223,11 +1271,14 @@ function PDFEditor({ pdfLib }) {
     // Render at device-pixel resolution for crisp, Adobe-quality text and
     // highlights on HiDPI/Retina screens; the CSS size stays in logical px.
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
-    canvas.width  = Math.floor(vp.width  * dpr);
-    canvas.height = Math.floor(vp.height * dpr);
-    canvas.style.width  = vp.width  + "px";
-    canvas.style.height = vp.height + "px";
+    canvas.width  = Math.round(vp.width  * dpr);
+    canvas.height = Math.round(vp.height * dpr);
+    // CSS size = exactly the backing store in device pixels (no resampling blur)
+    canvas.style.width  = canvas.width  / dpr + "px";
+    canvas.style.height = canvas.height / dpr + "px";
     setPageBase({ w: vp1.width, h: vp1.height });
+    applyZoomAnchor(canvas, vp1.width);
+    snapPage();
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const AM = pdfJsRef.current?.AnnotationMode;
@@ -1244,6 +1295,109 @@ function PDFEditor({ pdfLib }) {
   }, [scale]);
 
   useEffect(() => { renderPage(currentPage); }, [currentPage, scale, renderPage, docVersion, storageVersion]);
+
+  // ── Crisp rendering: keep the page on whole DEVICE pixels ──
+  // With Windows display scaling (125 %, 150 %…) the page often lands between
+  // two physical pixels (after a toolbar row changes height, or a scroll by a
+  // fractional amount) and the browser then resamples the canvas — the whole
+  // PDF looks blurry. Nudge the page box by the sub-pixel remainder instead.
+  const pageBoxRef  = useRef(null);
+  const leftColRef  = useRef(null);
+  const snapOffRef  = useRef({ x: 0, y: 0 });
+  const snapPage = useCallback(() => {
+    const box = pageBoxRef.current, cv = canvasRef.current;
+    if (!box || !cv) return;
+    const dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    const bx = r.left - snapOffRef.current.x, by = r.top - snapOffRef.current.y;   // position without our nudge
+    const nx = (Math.round(bx * dpr) - bx * dpr) / dpr, ny = (Math.round(by * dpr) - by * dpr) / dpr;
+    if (Math.abs(nx - snapOffRef.current.x) < 0.002 && Math.abs(ny - snapOffRef.current.y) < 0.002) return;
+    snapOffRef.current = { x: nx, y: ny };
+    box.style.transform = (Math.abs(nx) > 0.001 || Math.abs(ny) > 0.001) ? `translate(${nx}px, ${ny}px)` : "";
+  }, []);
+  // Re-snap after every render, scroll and resize.
+  useLayoutEffect(() => { snapPage(); });
+  useEffect(() => {
+    let raf = 0;
+    const onMove = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(snapPage); };
+    window.addEventListener("scroll", onMove, true);
+    window.addEventListener("resize", onMove);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("scroll", onMove, true); window.removeEventListener("resize", onMove); };
+  }, [snapPage]);
+
+  // ── Zoom (Acrobat-style: −/+ magnifiers, % field, presets, fit width/page) ──
+  const zoomAnchorRef = useRef(null);
+  const lastWheelRef  = useRef(0);
+  const zoomTo = (s, anchor) => {
+    s = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(s * 1000) / 1000));
+    if (Math.abs(s - scale) < 1e-4) return;
+    // Keep the point under the cursor (or the centre of the visible page) in place.
+    const ov = overlayRef.current?.getBoundingClientRect();
+    if (ov && ov.width && pageBase) {
+      let cx = anchor?.clientX, cy = anchor?.clientY;
+      if (cx == null) {
+        cx = (Math.max(ov.left, 0) + Math.min(ov.right, window.innerWidth)) / 2;
+        cy = (Math.max(ov.top, 0) + Math.min(ov.bottom, window.innerHeight)) / 2;
+      }
+      const k = ov.width / pageBase.w;
+      zoomAnchorRef.current = { px: (cx - ov.left) / k, py: (cy - ov.top) / k, cx, cy };
+    }
+    setScale(s);
+  };
+  const applyZoomAnchor = (canvas, baseW) => {
+    const a = zoomAnchorRef.current;
+    if (!a) return;
+    zoomAnchorRef.current = null;
+    const r = canvas.getBoundingClientRect(), k = r.width / baseW;
+    const dx = r.left + a.px * k - a.cx, dy = r.top + a.py * k - a.cy;
+    if (leftColRef.current && Math.abs(dx) > 0.5) leftColRef.current.scrollLeft += dx;
+    const sp = getScrollParent(canvas);
+    if (Math.abs(dy) > 0.5) { if (sp) sp.scrollTop += dy; else window.scrollBy(0, dy); }
+  };
+  const zoomStep = (dir, anchor) => {
+    const next = dir > 0 ? ZOOM_STEPS.find(z => z > scale + 1e-3) : [...ZOOM_STEPS].reverse().find(z => z < scale - 1e-3);
+    setZoomMode("custom");
+    if (next) zoomTo(next, anchor);
+  };
+  const fitScale = (mode) => {
+    const col = leftColRef.current;
+    if (!pageBase || !col) return null;
+    const fw = (col.clientWidth - 8) / pageBase.w;
+    if (mode === "fitWidth") return fw;
+    const sp = getScrollParent(col);
+    const availH = (sp ? sp.clientHeight : window.innerHeight) - 56;
+    return Math.min(fw, availH / pageBase.h);
+  };
+  const applyFit = (mode) => {
+    const s = fitScale(mode);
+    if (!s) return;
+    setZoomMode(mode);
+    zoomTo(s);
+    if (mode === "fitPage") setTimeout(() => pageBoxRef.current?.scrollIntoView({ block: "start" }), 80);
+  };
+  // Fit modes follow window resizes and pages of a different size.
+  useEffect(() => {
+    if (zoomMode === "custom") return;
+    const refit = () => { const s = fitScale(zoomMode); if (s && Math.abs(s - scale) > 0.004) zoomTo(s); };
+    refit();
+    window.addEventListener("resize", refit);
+    return () => window.removeEventListener("resize", refit);
+  }, [zoomMode, pageBase, scale]);
+  // Ctrl + mouse wheel zooms around the cursor.
+  useEffect(() => {
+    const el = leftColRef.current;
+    if (!el) return;
+    const onWheel = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const now = Date.now();
+      if (now - lastWheelRef.current < 90) return;
+      lastWheelRef.current = now;
+      zoomStep(e.deltaY < 0 ? 1 : -1, { clientX: e.clientX, clientY: e.clientY });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  });
 
   // Mouse position in PAGE units (independent of zoom).
   const getCanvasPos = (e) => {
@@ -1696,7 +1850,7 @@ function PDFEditor({ pdfLib }) {
       const url   = URL.createObjectURL(new Blob([bytes], { type:"application/pdf" }));
       const fname = `${outputName.trim().replace(/\.pdf$/i,"")||"edited"}.pdf`;
       setSaveResult({ url, filename: fname });
-    } catch(e) { setError("Save error: " + e.message); }
+    } catch(e) { setError(friendlyPdfError(e, "Save error: ")); }
     setSaving(false);
   };
 
@@ -2053,12 +2207,55 @@ function PDFEditor({ pdfLib }) {
             <button onClick={() => setCurrentPage(p => Math.max(0,p-1))} disabled={currentPage===0} style={{ ...navBtn, display:"flex", alignItems:"center", padding:"6px 9px" }}><Icon name="chevL" size={15}/></button>
             <span style={{ color:T.dim, fontSize:"12.5px", minWidth:"86px", textAlign:"center", fontFamily:T.mono }}>{currentPage+1} / {pageCount}</span>
             <button onClick={() => setCurrentPage(p => Math.min(pageCount-1,p+1))} disabled={currentPage===pageCount-1} style={{ ...navBtn, display:"flex", alignItems:"center", padding:"6px 9px" }}><Icon name="chevR" size={15}/></button>
-            <span style={{ color:T.faintest, fontSize:"12px", marginLeft:"8px" }}>Zoom</span>
-            {[0.8,1.0,1.2,1.5,2.0].map(z => (
-              <button key={z} onClick={() => setScale(z)} style={{ ...navBtn, fontFamily:T.mono, borderColor:scale===z?T.accent:"rgba(0,0,0,.10)", color:scale===z?T.accent:T.faint, background:scale===z?T.accentBg:"transparent" }}>
-                {Math.round(z*100)}%
-              </button>
-            ))}
+            {/* Zoom — Acrobat-style: −  [ 125 % ▾ ]  + */}
+            <div style={{ position:"relative", display:"flex", alignItems:"center", marginLeft:"10px", border:`1px solid ${T.border}`, borderRadius:"8px", background:"#fff", height:"32px" }}>
+              {(() => {
+                const zb = { display:"flex", alignItems:"center", justifyContent:"center", width:"32px", height:"30px", border:"none", background:"transparent", color:T.dim, cursor:"pointer", padding:0 };
+                const pct = Math.round(scale * 100);
+                const presets = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+                return (
+                  <>
+                    <button onClick={() => zoomStep(-1)} disabled={scale <= ZOOM_MIN + 1e-3} title="Zoom out (Ctrl −)" style={{ ...zb, opacity: scale <= ZOOM_MIN + 1e-3 ? .35 : 1, borderRadius:"7px 0 0 7px" }}
+                      onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.05)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}><Icon name="zoomOut" size={17}/></button>
+                    <div style={{ display:"flex", alignItems:"center", height:"100%", borderLeft:`1px solid ${T.border}`, borderRight:`1px solid ${T.border}` }}>
+                      <input value={zoomText ?? `${pct}%`} title="Zoom level — type a value and press Enter"
+                        onFocus={e => { setZoomText(String(pct)); const t = e.target; setTimeout(() => t.select(), 0); }}
+                        onChange={e => setZoomText(e.target.value)}
+                        onBlur={() => setZoomText(null)}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") { const v = parseFloat(String(zoomText).replace(",", ".")); if (v > 0) { setZoomMode("custom"); zoomTo(v / 100); } e.currentTarget.blur(); }
+                          if (e.key === "Escape") e.currentTarget.blur();
+                        }}
+                        style={{ width:"54px", height:"100%", textAlign:"center", border:"none", outline:"none", background:"transparent", fontFamily:T.mono, fontSize:"12.5px", color:T.text, padding:0 }}/>
+                      <button onClick={() => setShowZoomMenu(v => !v)} title="Zoom presets" style={{ ...zb, width:"22px", color:T.faint }}><Icon name="chevD" size={13}/></button>
+                    </div>
+                    <button onClick={() => zoomStep(1)} disabled={scale >= ZOOM_MAX - 1e-3} title="Zoom in (Ctrl +)" style={{ ...zb, opacity: scale >= ZOOM_MAX - 1e-3 ? .35 : 1, borderRadius:"0 7px 7px 0" }}
+                      onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.05)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}><Icon name="zoomIn" size={17}/></button>
+                    {showZoomMenu && (
+                      <>
+                        <div onMouseDown={() => setShowZoomMenu(false)} style={{ position:"fixed", inset:0, zIndex:60 }}/>
+                        <div style={{ position:"absolute", top:"calc(100% + 6px)", left:"28px", zIndex:61, minWidth:"170px", background:"#fff", border:`1px solid ${T.borderUp}`, borderRadius:"10px", boxShadow:"0 10px 30px rgba(0,0,0,.18)", padding:"5px", lineHeight:1.2 }}>
+                          {[["fitWidth","Fit width","Ctrl+2"],["fitPage","Fit page","Ctrl+0"]].map(([m, label, kb]) => (
+                            <button key={m} onClick={() => { setShowZoomMenu(false); applyFit(m); }} className="zoom-opt" style={{ display:"flex", alignItems:"center", gap:"8px", width:"100%", padding:"7px 10px", border:"none", borderRadius:"6px", background: zoomMode===m ? T.accentBg : "transparent", color: zoomMode===m ? T.accent : T.text, cursor:"pointer", fontSize:"12.5px", fontFamily:T.ui, textAlign:"left" }}>
+                              {label}<span style={{ marginLeft:"auto", fontSize:"10.5px", color:T.faint, fontFamily:T.mono }}>{kb}</span>
+                            </button>
+                          ))}
+                          <div style={{ height:"1px", background:T.border, margin:"4px 2px" }}/>
+                          {presets.map(z => {
+                            const on = zoomMode === "custom" && Math.abs(scale - z) < 1e-3;
+                            return (
+                              <button key={z} onClick={() => { setShowZoomMenu(false); setZoomMode("custom"); zoomTo(z); }} style={{ display:"flex", alignItems:"center", width:"100%", padding:"6px 10px", border:"none", borderRadius:"6px", background: on ? T.accentBg : "transparent", color: on ? T.accent : T.text, cursor:"pointer", fontSize:"12.5px", fontFamily:T.mono, textAlign:"left" }}>
+                                {Math.round(z*100)}%{z === 1 && <span style={{ marginLeft:"auto", fontSize:"10.5px", color:T.faint }}>Ctrl+1</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
             <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:"6px" }}>
               <input value={outputName} onChange={e => setOutputName(e.target.value)}
                 style={{ ...miniInput, width:"120px", fontFamily:T.mono }} placeholder="filename" />
@@ -2227,10 +2424,10 @@ function PDFEditor({ pdfLib }) {
 
           {/* Canvas + comments panel, side by side */}
           <div style={{ display:"flex", gap:"16px", alignItems:"flex-start", width:"100%" }}>
-            <div style={{ flex:"1 1 auto", minWidth:0, overflowX:"auto", paddingBottom:"4px" }}>
+            <div ref={leftColRef} style={{ flex:"1 1 auto", minWidth:0, overflowX:"auto", overflowY:"hidden", paddingBottom:"4px" }}>
 
           {/* Canvas + SVG overlay */}
-          <div style={{ position:"relative", display:"inline-block", lineHeight:0, border:"1px solid rgba(0,0,0,.08)", borderRadius:"4px", overflow:"hidden", alignSelf:"flex-start", boxShadow:"0 1px 3px rgba(0,0,0,.10), 0 8px 24px rgba(0,0,0,.06)" }}>
+          <div ref={pageBoxRef} style={{ position:"relative", display:"inline-block", lineHeight:0, margin:"1px", overflow:"hidden", alignSelf:"flex-start", boxShadow:"0 0 0 1px rgba(0,0,0,.08), 0 1px 3px rgba(0,0,0,.10), 0 8px 24px rgba(0,0,0,.06)" }}>
             <canvas ref={canvasRef} style={{ display:"block" }} />
             <svg ref={overlayRef}
               viewBox={pageBase ? `0 0 ${pageBase.w} ${pageBase.h}` : undefined}
@@ -2917,7 +3114,15 @@ export default function PDFTools() {
       const isPng  = f.type === "image/png"  || /\.png$/i.test(f.name);
       const isJpg  = f.type === "image/jpeg" || /\.jpe?g$/i.test(f.name);
 
-      if (isJpg) {
+      if (isJpg && jpegOrientation(bytes) > 1 && typeof createImageBitmap === "function") {
+        // Rotated photo: let the browser apply the EXIF orientation, then re-encode.
+        const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), { imageOrientation: "from-image" });
+        const cvs = document.createElement("canvas");
+        cvs.width = bmp.width; cvs.height = bmp.height;
+        cvs.getContext("2d").drawImage(bmp, 0, 0);
+        const blob = await new Promise(res => cvs.toBlob(res, "image/jpeg", 0.95));
+        embedded = await pdfDoc.embedJpg(new Uint8Array(await blob.arrayBuffer()));
+      } else if (isJpg) {
         embedded = await pdfDoc.embedJpg(bytes);
       } else if (isPng) {
         embedded = await pdfDoc.embedPng(bytes);
@@ -2995,7 +3200,7 @@ export default function PDFTools() {
       const page = await doc.getPage(pageNum);
       const viewport = page.getViewport({ scale: dpiScale });
       const cvs = document.createElement("canvas");
-      cvs.width = viewport.width; cvs.height = viewport.height;
+      cvs.width = Math.round(viewport.width); cvs.height = Math.round(viewport.height);
       const ctx = cvs.getContext("2d");
       // White background for JPEG (no transparency support)
       if (fmt==="jpeg") { ctx.fillStyle="#ffffff"; ctx.fillRect(0,0,cvs.width,cvs.height); }
@@ -3058,6 +3263,7 @@ export default function PDFTools() {
   // Build the downloadable HTML result once the translation text is ready.
   // Shared by both the Claude and Google Translate engines.
   const buildTranslationResult = (translated, fromLang, toLang, extracted, runId) => {
+    const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3078,9 +3284,9 @@ export default function PDFTools() {
 <body>
   <header>
     <h1>${fromLang} &rarr; ${toLang} Translation</h1>
-    <div class="meta">Source: ${files[0].name} &nbsp;&middot;&nbsp; ${new Date().toLocaleDateString()}</div>
+    <div class="meta">Source: ${esc(files[0].name)} &nbsp;&middot;&nbsp; ${new Date().toLocaleDateString()}</div>
   </header>
-  ${translated.split(/\n\n+/).map(p => p.trim() ? `<p>${p.trim().replace(/\n/g,' ')}</p>` : '').join('\n  ')}
+  ${translated.split(/\n\n+/).map(p => p.trim() ? `<p>${esc(p.trim().replace(/\n/g,' '))}</p>` : '').join('\n  ')}
 </body>
 </html>`;
     const blob = new Blob([htmlContent], { type: "text/html;charset=utf-8" });
@@ -3239,8 +3445,17 @@ export default function PDFTools() {
     }
 
     try {
-      // Step 3: streaming API call — words appear live as they're generated
-      const textToTranslate = extracted.slice(0, 12000);
+      // Step 3: translate the WHOLE document — split at paragraph boundaries
+      // into chunks (previously everything after 12,000 characters was silently
+      // dropped). Each chunk streams in live, appended to the preview.
+      const CHUNK = 24000;
+      const chunks = [];
+      let cur = "";
+      for (const p of extracted.split(/\n\n+/)) {
+        if (cur && cur.length + p.length + 2 > CHUNK) { chunks.push(cur); cur = p; }
+        else cur = cur ? cur + "\n\n" + p : p;
+      }
+      if (cur) chunks.push(cur);
 
       // Build headers — include key + version when running outside Claude's artifact platform
       const fetchHeaders = { "Content-Type": "application/json" };
@@ -3252,83 +3467,76 @@ export default function PDFTools() {
         fetchHeaders["anthropic-dangerous-direct-browser-access"] = "true";
       }
 
-      const controller = new AbortController();
-      abortRef.current = controller;
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        signal: controller.signal,
-        headers: fetchHeaders,
-        body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 8000,
-          stream: true,
-          system: `You are a professional translator. Translate the text from ${fromLang} to ${toLang}. Preserve paragraph structure and line breaks. Output ONLY the translated text — no explanations, no preamble, no notes.`,
-          messages: [{ role: "user", content: textToTranslate }],
-        }),
-      });
-
-      if (activeRunRef.current !== runId) {
-        controller.abort();
-        return;
-      }
-
-      if (!response.ok) {
-        const err = await response.json();
-        setError("Translation failed: " + (err.error?.message || response.statusText));
-        setResult(null);
-        return;
-      }
-
-      // Read the SSE stream and accumulate text live
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
       let translated = "";
-      let buffer = "";
+      for (let ci = 0; ci < chunks.length; ci++) {
+        if (activeRunRef.current !== runId) return;
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          signal: controller.signal,
+          headers: fetchHeaders,
+          body: JSON.stringify({
+            model: "claude-haiku-5-5",
+            max_tokens: 64000,
+            stream: true,
+            output_config: { effort: "low" },   // plain translation needs little reasoning
+            system: `You are a professional translator. Translate the text from ${fromLang} to ${toLang}. Preserve paragraph structure and line breaks. Output ONLY the translated text — no explanations, no preamble, no notes.`,
+            messages: [{ role: "user", content: chunks[ci] }],
+          }),
+        });
 
-      let streamDone = false;
-      while (!streamDone) {
-        if (activeRunRef.current !== runId) {
-          reader.cancel();
+        if (activeRunRef.current !== runId) { controller.abort(); return; }
+
+        if (!response.ok) {
+          let msg = response.statusText || `HTTP ${response.status}`;
+          try { const err = await response.json(); msg = err.error?.message || msg; } catch (_) {}
+          setError("Translation failed: " + msg);
+          setResult(null);
           return;
         }
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (!data) continue;
-          try {
-            const evt = JSON.parse(data);
-            // Anthropic terminates with message_stop (NOT "[DONE]" which is OpenAI's format)
-            if (evt.type === "message_stop") { streamDone = true; break; }
-            if (evt.type === "message_delta" && evt.delta?.stop_reason) { streamDone = true; break; }
-            if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
-              translated += evt.delta.text;
-              if (activeRunRef.current === runId) {
-                setResult(prev => ({ ...prev, preview: translated }));
-              }
-            }
-            if (evt.type === "error") {
-              setError("Translation error: " + (evt.error?.message || "Unknown error"));
-              setResult(null);
-              return;
-            }
-          } catch (_) { /* skip malformed lines */ }
-        }
-      }
-      reader.cancel();
 
-      // Flush any remaining data left in buffer after stream ends
-      if (buffer.trim().startsWith("data: ")) {
-        try {
-          const evt = JSON.parse(buffer.slice(6).trim());
+        // Read the SSE stream and accumulate text live
+        const prefix = translated ? translated + "\n\n" : "";
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let part = "", buffer = "", stopReason = null, streamDone = false;
+        const handle = (evt) => {
+          // Anthropic terminates with message_stop (NOT "[DONE]" which is OpenAI's format)
+          if (evt.type === "message_stop") { streamDone = true; return; }
+          if (evt.type === "message_delta" && evt.delta?.stop_reason) { stopReason = evt.delta.stop_reason; return; }
           if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
-            translated += evt.delta.text;
+            part += evt.delta.text;
+            if (activeRunRef.current === runId) setResult(prev => ({ ...prev, preview: prefix + part }));
           }
-        } catch (_) {}
+          if (evt.type === "error") throw new Error(evt.error?.message || "Unknown error");
+        };
+        while (!streamDone) {
+          if (activeRunRef.current !== runId) { reader.cancel(); return; }
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (!data) continue;
+            let evt; try { evt = JSON.parse(data); } catch (_) { continue; }   // skip malformed lines
+            handle(evt);
+            if (streamDone) break;
+          }
+        }
+        reader.cancel();
+        // Flush any remaining data left in buffer after stream ends
+        if (buffer.trim().startsWith("data: ")) { try { handle(JSON.parse(buffer.trim().slice(6))); } catch (_) {} }
+
+        if (stopReason === "refusal") {
+          setError(`The model declined to translate part ${ci + 1} of ${chunks.length}.`);
+          setResult(null);
+          return;
+        }
+        translated = prefix + part.trim();
       }
 
       if (!translated.trim()) {
@@ -3384,7 +3592,8 @@ export default function PDFTools() {
       for (let i = 1; i <= doc.numPages; i++) {
         const page = await doc.getPage(i);
         const tc = await page.getTextContent();
-        extracted += tc.items.map(it => it.str).join(" ") + "\n\n";
+        // Same approach as pdf.js' own find bar: concatenate runs, newline at each end-of-line marker.
+        extracted += tc.items.map(it => (it.str || "") + (it.hasEOL ? "\n" : "")).join("").replace(/[ \t]+\n/g, "\n").trim() + "\n\n";
       }
     } catch(e) { setError("Extract error: " + e.message); return; }
     extracted = extracted.trim();
@@ -3418,7 +3627,7 @@ export default function PDFTools() {
       else if (activeTool === "pdf2word")  await runPdf2Word();
       else if (activeTool === "translate") await runTranslate(runId);
       else if (activeTool === "extract")   await runExtract();
-    } catch(e) { setError("Error: " + e.message); }
+    } catch(e) { setError(friendlyPdfError(e)); }
     finally {
       if (activeRunRef.current === runId) setLoading(false);
       runningRef.current = false;
