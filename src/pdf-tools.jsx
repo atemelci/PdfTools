@@ -735,6 +735,14 @@ function dataUrlToBytes(url) {
   for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
   return out;
 }
+// Plain text of an XHTML rich-text string (/RC).
+function richTextToPlain(rc) {
+  if (!rc || !/</.test(rc)) return (rc || "").trim();
+  return rc.replace(/<\?xml[^>]*>/gi, "").replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div)>/gi, "\n").replace(/<[^>]+>/g, "")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+    .replace(/\n{3,}/g, "\n\n").trim();
+}
 // Identity of a note's image window (to detect edits that require rewriting it).
 function noteImageKey(a) {
   const im = a && a.image;
@@ -760,6 +768,8 @@ const BADGE_DX = 18;   // comment marker: on-screen px to the right of the highl
 async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
   const { PDFName, PDFDict, PDFArray, PDFRef } = pdfLib;
   const out = [];
+  const hideIds = [];                 // pdf.js ids that must not be painted on the canvas
+  out.hideIds = hideIds;
   const pages = doc.getPages();
   for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
     const annots = pages[pageIdx].node.Annots && pages[pageIdx].node.Annots();
@@ -832,10 +842,14 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
         } catch (_) {}
       }
 
+      // Acrobat keeps the note text in /Contents and a rich-text copy in /RC;
+      // some tools write only /RC — fall back to its plain text.
+      let text = (str("Contents") || "").replace(/\r\n?/g, "\n").trim();
+      if (!text) text = richTextToPlain(str("RC"));
       raw.push({
-        i, key, sub, box, quads, color, hex, ptImage, imgSrc,
+        i, key, sub, box, quads, color, hex, ptImage, imgSrc, text,
         rt: String(d.get(PDFName.of("RT")) || ""),
-        text: (str("Contents") || "").replace(/\r\n?/g, "\n").trim(),
+        state: d.get(PDFName.of("State")) || d.get(PDFName.of("StateModel")) ? (str("State") || "Marked") : "",
         author: str("T"), date: parsePdfDate(str("M") || str("CreationDate")),
         irt: refKey("IRT"), popup: refKey("Popup"), flags: num("F") || 0,
         pdfjsId: ref instanceof PDFRef ? (ref.generationNumber ? `${ref.objectNumber}R${ref.generationNumber}` : `${ref.objectNumber}R`) : null,
@@ -850,7 +864,20 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
       const root = a.irt && byRef.has(a.irt) ? raw[byRef.get(a.irt)] : null;
       if (root && a.ptImage && a.imgSrc && a.box && root.box && !root.img) root.img = a;
     }
-    const skip = (a) => a.grouped || a.sub === "Popup" || a.sub === "Link" || a.sub === "Widget" || (a.flags & 2);   // 2 = Hidden
+    // Review states ("Accepted", "Marked"…) are /Text annotations with /IRT:
+    // attach them to their parent as a status tag instead of a fake reply.
+    for (const a of raw) {
+      if (!a.state || !a.irt || !byRef.has(a.irt)) continue;
+      a.isState = true;
+      const parent = raw[byRef.get(a.irt)];
+      (parent.states = parent.states || []).push(a);
+    }
+    // Acrobat never paints sticky notes, replies, review states or pop-up
+    // windows onto the page the way pdf.js does (stretched icons, pop-up boxes
+    // over the text). Hide them all from the canvas; the app draws one clean,
+    // fixed-size icon per real note itself.
+    for (const a of raw) if ((a.sub === "Text" || a.sub === "Popup") && a.pdfjsId) hideIds.push(a.pdfjsId);
+    const skip = (a) => a.grouped || a.isState || a.sub === "Popup" || a.sub === "Link" || a.sub === "Widget" || (a.flags & 2);   // 2 = Hidden
     // A reply (/IRT) belongs to the root of its thread.
     const rootOf = (a) => { let cur = a, guard = 0; while (cur.irt && byRef.has(cur.irt) && guard++ < 50) cur = raw[byRef.get(cur.irt)]; return cur; };
     const replies = new Map();   // root raw idx → [raw]
@@ -868,7 +895,7 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
     raw.forEach((a, ri) => {
       if (skip(a) || isReply(a)) return;
       const thread = replies.get(ri) || [];
-      if (!a.text && !thread.length && !a.img) return;   // nothing to show
+      if (!a.text && !thread.length && !a.img && a.sub !== "Text") return;   // nothing to show
       const g = a.box || (a.quads[0]) || { x: 0, y: 0, w: 0, h: 0 };
       const isMarkup = MARKUP_SUBTYPES.includes(a.sub) && a.quads.length;
       // Union of the quads (markup) or the Rect.
@@ -900,6 +927,7 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
           comment: a.text, origComment: a.text,
           image: im ? { src: im.imgSrc, dx: im.box.x - a.box.x, dy: im.box.y - a.box.y, w: im.box.w, h: im.box.h, show: !(im.flags & 2) } : null,
           imgIndex: im ? im.i : null, imgPdfjsId: im ? im.pdfjsId : null,
+          states: (a.states || []).map(x => ({ state: x.state, author: x.author })), stateIdx: (a.states || []).map(x => x.i),
         };
         sticky.origX = sticky.x; sticky.origY = sticky.y; sticky.origColor = sticky.color; sticky.origImgKey = noteImageKey(sticky);
         out.push(sticky);
@@ -909,6 +937,7 @@ async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
         subtype: a.sub, x, y, w: Math.max(w, 4), h: Math.max(h, 4), quads: isMarkup ? a.quads : null, bx, by, bdx, bdy,
         color: a.color, author: a.author, date: a.date ? a.date.getTime() : null,
         comment: a.text, origComment: a.text, readOnly: a.sub === "FreeText",
+        states: (a.states || []).map(x => ({ state: x.state, author: x.author })), stateIdx: (a.states || []).map(x => x.i),
       });
       thread
         .sort((p, q) => (p.date ? p.date.getTime() : 0) - (q.date ? q.date.getTime() : 0))
@@ -1026,7 +1055,8 @@ function PDFEditor({ pdfLib }) {
   // through the same pdf.js viewport — exactly how Acrobat/pdf.js position them.
   const [pageBase, setPageBase] = useState(null);           // {w,h} of the current page in page units
   const importedRef  = useRef([]);                           // notes read from the file: [{id, page, annotIndex, popupIndex, pdfjsId}]
-  const hiddenRef    = useRef(new Set());                    // pdf.js ids currently hidden on the canvas (deleted imported notes)
+  const hiddenRef    = useRef(new Set());                    // pdf.js ids currently hidden on the canvas
+  const alwaysHiddenRef = useRef(new Set());                 // sticky notes / replies / states / pop-ups: never painted by pdf.js
   const renderTaskRef = useRef(null);
   const [storageVersion, setStorageVersion] = useState(0);  // bumped when the canvas must re-render (note deleted/restored)
 
@@ -1148,15 +1178,19 @@ function PDFEditor({ pdfLib }) {
       if (hide) hiddenRef.current.add(pid); else hiddenRef.current.delete(pid);
       try { doc.annotationStorage.setValue(pid, { noView: hide }); } catch (_) {}
     };
+    // Sticky notes (and their image windows) are drawn by the app so they can be
+    // moved/recoloured; replies, review states and pop-ups are never painted;
+    // deleted notes disappear. Everything else is painted by pdf.js.
+    const want = new Set(alwaysHiddenRef.current);
     for (const imp of importedRef.current) {
-      // Sticky notes (and their image windows) are drawn by the app so they can
-      // be moved/recoloured; deleted notes disappear. Everything else: pdf.js.
-      const hide = !present.has(imp.id) || imp.kind === "sticky";
-      setHidden(imp.pdfjsId, hide);
-      setHidden(imp.imgPdfjsId, hide);
+      if (!present.has(imp.id) || imp.kind === "sticky") {
+        if (imp.pdfjsId) want.add(imp.pdfjsId);
+        if (imp.imgPdfjsId) want.add(imp.imgPdfjsId);
+      }
     }
+    for (const pid of new Set([...want, ...hiddenRef.current])) setHidden(pid, want.has(pid));
     if (changed) setStorageVersion(v => v + 1);
-  }, [annotations]);
+  }, [annotations, docVersion]);
 
   const canvasRef    = useRef();
   const overlayRef   = useRef();
@@ -1344,7 +1378,7 @@ function PDFEditor({ pdfLib }) {
   const loadPDF = async (f) => {
     setLoading(true); setError(""); setAnnotations([]); setHistory([[]]); setHistoryIdx(0); setSaveResult(null);
     historyIdxRef.current = 0; setSelected(null); setActiveComment(null);
-    importedRef.current = []; hiddenRef.current = new Set();
+    importedRef.current = []; hiddenRef.current = new Set(); alwaysHiddenRef.current = new Set();
     setFile(f);
     try {
       const ab = await f.arrayBuffer();
@@ -1364,9 +1398,11 @@ function PDFEditor({ pdfLib }) {
       // CropBox offset and page rotation, so markers land on the right words.
       const existingNotes = [];
       try {
-        existingNotes.push(...await readPdfNotes(pdfLib, doc, pdfJsDocRef.current));
+        const notes = await readPdfNotes(pdfLib, doc, pdfJsDocRef.current);
+        existingNotes.push(...notes);
+        alwaysHiddenRef.current = new Set(notes.hideIds || []);
       } catch (_) { /* annotations are optional — ignore read errors */ }
-      importedRef.current = existingNotes.map(n => ({ id:n.id, page:n.page, kind:n.type, annotIndex:n.annotIndex, popupIndex:n.popupIndex, pdfjsId:n.pdfjsId, imgIndex:n.imgIndex ?? null, imgPdfjsId:n.imgPdfjsId ?? null }));
+      importedRef.current = existingNotes.map(n => ({ id:n.id, page:n.page, kind:n.type, annotIndex:n.annotIndex, popupIndex:n.popupIndex, pdfjsId:n.pdfjsId, imgIndex:n.imgIndex ?? null, imgPdfjsId:n.imgPdfjsId ?? null, stateIdx:n.stateIdx || [] }));
       if (existingNotes.length) {
         setAnnotations(existingNotes);
         setHistory([existingNotes]);
@@ -1927,7 +1963,11 @@ function PDFEditor({ pdfLib }) {
       const markRemove = (pi, idx) => { if (typeof idx !== "number") return; if (!removals.has(pi)) removals.set(pi, new Set()); removals.get(pi).add(idx); };
       for (const imp of importedRef.current) {
         const ann = present.get(imp.id);
-        if (!ann) { markRemove(imp.page, imp.annotIndex); markRemove(imp.page, imp.popupIndex); markRemove(imp.page, imp.imgIndex); continue; }
+        if (!ann) {
+          markRemove(imp.page, imp.annotIndex); markRemove(imp.page, imp.popupIndex); markRemove(imp.page, imp.imgIndex);
+          (imp.stateIdx || []).forEach(i => markRemove(imp.page, i));
+          continue;
+        }
         const text = (ann.comment || "").trim();
         const textChanged = text !== (ann.origComment || "");
         const isSticky = ann.type === "sticky";
@@ -1942,6 +1982,7 @@ function PDFEditor({ pdfLib }) {
           if (textChanged) {
             if (text) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));
             else d.delete(PDFName.of("Contents"));
+            d.delete(PDFName.of("RC"));      // Acrobat shows the rich-text copy first — it would still hold the old text
           }
           if (moved) {
             // New position; its pop-up window moves by the same amount.
@@ -2501,7 +2542,8 @@ function PDFEditor({ pdfLib }) {
                       onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.05)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}><Icon name="zoomOut" size={17}/></button>
                     <div style={{ display:"flex", alignItems:"center", height:"100%", borderLeft:`1px solid ${T.border}`, borderRight:`1px solid ${T.border}` }}>
                       <input value={zoomText ?? `${pct}%`} title="Zoom level — type a value and press Enter"
-                        onFocus={e => { setZoomText(String(pct)); const t = e.target; setTimeout(() => t.select(), 0); }}
+                        onFocus={e => e.target.select()}
+                        onMouseUp={e => e.preventDefault()}
                         onChange={e => setZoomText(e.target.value)}
                         onBlur={() => setZoomText(null)}
                         onKeyDown={e => {
@@ -3147,6 +3189,15 @@ function PDFEditor({ pdfLib }) {
                               }}>
                                 {a.comment ? markText(a.comment) : (a.image ? "" : "Add a note…")}
                               </div>
+                              {a.states && a.states.length > 0 && (
+                                <div style={{ margin:"-3px 10px 8px 39px", display:"flex", flexWrap:"wrap", gap:"4px" }}>
+                                  {a.states.map((st, si) => (
+                                    <span key={si} style={{ fontSize:"10.5px", padding:"1px 7px", borderRadius:"10px", background:"rgba(31,138,83,.10)", color:T.good, border:"1px solid rgba(31,138,83,.25)" }}>
+                                      ✓ {st.state}{st.author ? ` · ${st.author}` : ""}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                               {a.image && (
                                 <div style={{ margin:"0 10px 9px 39px" }}>
                                   <img src={a.image.src} alt="" onClick={e=>{ e.stopPropagation(); setLightbox(a.image.src); }}
