@@ -657,6 +657,152 @@ function SignatureModal({ onConfirm, onCancel }) {
 }
 
 /* ══════════════════════════════════════════
+   PDF ANNOTATION (COMMENT) HELPERS
+══════════════════════════════════════════ */
+// "D:20240115103000+03'00'" → Date (or null)
+function parsePdfDate(s) {
+  const m = /D?:?(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?/.exec(s || "");
+  if (!m || +m[1] < 1980 || +m[1] > 2200) return null;   // ignore malformed dates
+  const d = new Date(+m[1], (+m[2] || 1) - 1, +m[3] || 1, +m[4] || 0, +m[5] || 0, +m[6] || 0);
+  return isNaN(d) ? null : d;
+}
+function pdfDateNow() {
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  return `D:${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+function formatNoteDate(d) {
+  if (!d) return "";
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt)) return "";
+  return dt.toLocaleString(undefined, { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+const MARKUP_SUBTYPES = ["Highlight", "Underline", "StrikeOut", "Squiggly"];
+const BADGE_DX = 18;   // comment marker: on-screen px to the right of the highlighted line's end
+
+// Read every annotation that carries a note (or has replies) from a pdf-lib
+// document. Geometry goes through the pdf.js viewport at scale 1, so the
+// result is in "page units" (top-left origin, CropBox + /Rotate applied).
+async function readPdfNotes(pdfLib, doc, pdfJsDoc) {
+  const { PDFName, PDFDict, PDFArray, PDFRef } = pdfLib;
+  const out = [];
+  const pages = doc.getPages();
+  for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+    const annots = pages[pageIdx].node.Annots && pages[pageIdx].node.Annots();
+    if (!annots || !annots.size()) continue;
+    let vp1 = null;
+    try { vp1 = (await pdfJsDoc.getPage(pageIdx + 1)).getViewport({ scale: 1 }); } catch (_) {}
+    const pageH = pages[pageIdx].getSize().height;
+    const toView = (x, y) => vp1 ? vp1.convertToViewportPoint(x, y) : [x, pageH - y];
+    const rot = (((vp1 ? vp1.rotation : 0) % 360) + 360) % 360;
+    const textDir = { 0: [1, 0], 90: [0, 1], 180: [-1, 0], 270: [0, -1] }[rot] || [1, 0];   // on-screen reading direction
+
+    const raw = [];
+    const byRef = new Map();     // "12 0 R" → raw index
+    for (let i = 0; i < annots.size(); i++) {
+      let d; try { d = annots.lookup(i, PDFDict); } catch (_) { continue; }
+      if (!d) continue;
+      const ref = annots.get(i);
+      const key = ref instanceof PDFRef ? ref.toString() : null;
+      const str = (name) => { try { const v = d.lookup(PDFName.of(name)); return v && v.decodeText ? v.decodeText() : ""; } catch (_) { return ""; } };
+      const num = (name) => { try { const v = d.lookup(PDFName.of(name)); return v && v.asNumber ? v.asNumber() : null; } catch (_) { return null; } };
+      const refKey = (name) => { const v = d.get(PDFName.of(name)); return v instanceof PDFRef ? v.toString() : null; };
+      const sub = String(d.get(PDFName.of("Subtype")) || "").replace(/^\//, "");
+
+      // Geometry: Rect, plus one box per QuadPoints quad (one per highlighted line)
+      let box = null;
+      try {
+        const r = d.lookup(PDFName.of("Rect"), PDFArray);
+        if (r && r.size() >= 4) {
+          const [x1, y1] = toView(r.lookup(0).asNumber(), r.lookup(1).asNumber());
+          const [x2, y2] = toView(r.lookup(2).asNumber(), r.lookup(3).asNumber());
+          box = { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
+        }
+      } catch (_) {}
+      const quads = [];
+      try {
+        const q = d.lookup(PDFName.of("QuadPoints"), PDFArray);
+        if (q) for (let k = 0; k + 7 < q.size(); k += 8) {
+          const xs = [], ys = [];
+          for (let m = 0; m < 8; m += 2) { const [vx, vy] = toView(q.lookup(k + m).asNumber(), q.lookup(k + m + 1).asNumber()); xs.push(vx); ys.push(vy); }
+          const bx = Math.min(...xs), by = Math.min(...ys);
+          quads.push({ x: bx, y: by, w: Math.max(...xs) - bx, h: Math.max(...ys) - by });
+        }
+      } catch (_) {}
+      let color = null;
+      try {
+        const c = d.lookup(PDFName.of("C"), PDFArray);
+        if (c && c.size() === 3) color = `rgba(${[0, 1, 2].map(k => Math.round(c.lookup(k).asNumber() * 255)).join(",")},0.45)`;
+      } catch (_) {}
+
+      raw.push({
+        i, key, sub, box, quads, color,
+        text: (str("Contents") || "").replace(/\r\n?/g, "\n").trim(),
+        author: str("T"), date: parsePdfDate(str("M") || str("CreationDate")),
+        irt: refKey("IRT"), popup: refKey("Popup"), flags: num("F") || 0,
+        pdfjsId: ref instanceof PDFRef ? (ref.generationNumber ? `${ref.objectNumber}R${ref.generationNumber}` : `${ref.objectNumber}R`) : null,
+      });
+      if (key) byRef.set(key, raw.length - 1);
+    }
+
+    const skip = (a) => a.sub === "Popup" || a.sub === "Link" || a.sub === "Widget" || (a.flags & 2);   // 2 = Hidden
+    // A reply (/IRT) belongs to the root of its thread.
+    const rootOf = (a) => { let cur = a, guard = 0; while (cur.irt && byRef.has(cur.irt) && guard++ < 50) cur = raw[byRef.get(cur.irt)]; return cur; };
+    const replies = new Map();   // root raw idx → [raw]
+    for (const a of raw) {
+      if (skip(a) || !a.irt || !byRef.has(a.irt)) continue;
+      const root = rootOf(a);
+      if (root === a || skip(root)) continue;
+      const ri = raw.indexOf(root);
+      if (!replies.has(ri)) replies.set(ri, []);
+      replies.get(ri).push(a);
+    }
+    const isReply = (a) => a.irt && byRef.has(a.irt) && rootOf(a) !== a && !skip(rootOf(a));
+    const popupIdx = (a) => (a.popup && byRef.has(a.popup) ? raw[byRef.get(a.popup)].i : null);
+
+    raw.forEach((a, ri) => {
+      if (skip(a) || isReply(a)) return;
+      const thread = replies.get(ri) || [];
+      if (!a.text && !thread.length) return;           // nothing to show
+      const g = a.box || (a.quads[0]) || { x: 0, y: 0, w: 0, h: 0 };
+      const isMarkup = MARKUP_SUBTYPES.includes(a.sub) && a.quads.length;
+      // Union of the quads (markup) or the Rect.
+      let x = g.x, y = g.y, w = g.w, h = g.h;
+      if (isMarkup) {
+        const x1 = Math.min(...a.quads.map(q => q.x)), y1 = Math.min(...a.quads.map(q => q.y));
+        const x2 = Math.max(...a.quads.map(q => q.x + q.w)), y2 = Math.max(...a.quads.map(q => q.y + q.h));
+        x = x1; y = y1; w = x2 - x1; h = y2 - y1;
+      }
+      // Marker: end of the FIRST highlighted line (Acrobat's comment anchor),
+      // the icon itself for sticky notes, top-right corner for anything else.
+      // On rotated pages "past the end of the line" follows the text direction.
+      let bx, by, bdx = 0, bdy = 0;
+      if (isMarkup) {
+        const q = a.quads[0], [ux, uy] = textDir;
+        bx = q.x + q.w / 2 + ux * q.w / 2; by = q.y + q.h / 2 + uy * q.h / 2;
+        bdx = ux * BADGE_DX; bdy = uy * BADGE_DX;
+      }
+      else if (a.sub === "Text") { bx = x + Math.min(w, 20) / 2; by = y + Math.min(h, 20) / 2; }
+      else { bx = x + w; by = y; }
+      const id = `pdfnote-${pageIdx}-${a.i}`;
+      out.push({
+        id, page: pageIdx, type: "note", existing: true, annotIndex: a.i, popupIndex: popupIdx(a), pdfjsId: a.pdfjsId,
+        subtype: a.sub, x, y, w: Math.max(w, 4), h: Math.max(h, 4), quads: isMarkup ? a.quads : null, bx, by, bdx, bdy,
+        color: a.color, author: a.author, date: a.date ? a.date.getTime() : null,
+        comment: a.text, origComment: a.text, readOnly: a.sub === "FreeText",
+      });
+      thread
+        .sort((p, q) => (p.date ? p.date.getTime() : 0) - (q.date ? q.date.getTime() : 0))
+        .forEach(r => out.push({
+          id: `pdfnote-${pageIdx}-${r.i}`, page: pageIdx, type: "reply", parentId: id, existing: true,
+          annotIndex: r.i, popupIndex: popupIdx(r), pdfjsId: r.pdfjsId,
+          author: r.author, date: r.date ? r.date.getTime() : null, comment: r.text, origComment: r.text,
+        }));
+    });
+  }
+  return out;
+}
+
+/* ══════════════════════════════════════════
    PDF EDITOR
 ══════════════════════════════════════════ */
 function PDFEditor({ pdfLib }) {
@@ -683,7 +829,7 @@ function PDFEditor({ pdfLib }) {
   const [showTextModal, setShowTextModal] = useState(false);
   const [pendingPos, setPendingPos]       = useState(null);
   const [textInput, setTextInput]         = useState("");
-  const [fontSize, setFontSize]           = useState(16);
+  const [fontSize, setFontSize]           = useState(14);   // pt (page units)
   const [fontColor, setFontColor]         = useState("#000000");
   const [fontFamily, setFontFamily]       = useState(FONT_OPTIONS[0].value);
   const [bold, setBold]                   = useState(false);
@@ -722,29 +868,77 @@ function PDFEditor({ pdfLib }) {
   const [activeComment, setActiveComment] = useState(null);   // ann id whose note popup is open
   const [commentPos, setCommentPos]       = useState({ left: 0, top: 0 });
   const commentInputRef = useRef(null);
+  const panelListRef    = useRef(null);
 
-  // Place & open the floating note editor next to an annotation — rendered as a
-  // fixed, high-z-index card so it is always on top of the PDF, never behind it.
+  // ── Coordinate model ──
+  // Every annotation is stored in PAGE units: the pdf.js viewport at scale 1
+  // (1 unit = 1 PDF point, top-left origin, CropBox offset and /Rotate already
+  // applied). The overlay SVG maps those units onto the canvas via its viewBox,
+  // so markers stay glued to the text at every zoom level, and import/export go
+  // through the same pdf.js viewport — exactly how Acrobat/pdf.js position them.
+  const [pageBase, setPageBase] = useState(null);           // {w,h} of the current page in page units
+  const importedRef  = useRef([]);                           // notes read from the file: [{id, page, annotIndex, popupIndex, pdfjsId}]
+  const hiddenRef    = useRef(new Set());                    // pdf.js ids currently hidden on the canvas (deleted imported notes)
+  const renderTaskRef = useRef(null);
+  const [storageVersion, setStorageVersion] = useState(0);  // bumped when the canvas must re-render (note deleted/restored)
+
+  // Where a note's marker sits, in page units.
+  // dx = on-screen offset in px (marker drawn just right of the line end).
+  const noteAnchor = (ann) => ann.type === "note"
+    ? { x: ann.bx ?? ann.x, y: ann.by ?? ann.y, dx: ann.bdx || 0, dy: ann.bdy || 0 }
+    : { x: (ann.x || 0) + (ann.w || 0), y: (ann.y || 0) + Math.min((ann.h || 0) / 2, 9), dx: BADGE_DX, dy: 0 };
+
+  // Nearest scrollable ancestor (the app's main content pane), or null for the window.
+  const getScrollParent = (el) => {
+    for (let p = el?.parentElement; p; p = p.parentElement) {
+      const s = getComputedStyle(p);
+      if (/(auto|scroll)/.test(s.overflowY + s.overflow) && p.scrollHeight > p.clientHeight + 1) return p;
+    }
+    return null;
+  };
+
+  // Place the floating note editor next to an annotation's marker — a fixed,
+  // high-z-index card, so it is always on top of the PDF, never behind it.
   const placeCommentPopup = (ann) => {
     const rect = overlayRef.current?.getBoundingClientRect();
-    const POPW = 270, POPH = 196, M = 12;
+    const POPW = 300, POPH = 240, M = 12;
     let left, top;
-    if (rect) {
-      left = rect.left + (ann.x || 0) + (ann.w || 0) + 12;
-      top  = rect.top + (ann.y || 0);
-      if (left + POPW > window.innerWidth - M) left = rect.left + (ann.x || 0) - POPW - 12;
-      if (left < M) left = M;
+    if (rect && rect.width) {
+      const k = pageBase ? rect.width / pageBase.w : scale;  // page units → screen px
+      const a = noteAnchor(ann);
+      const boxL = rect.left + (ann.x || a.x) * k;
+      left = rect.left + a.x * k + (a.dx || 0) + 16;
+      top  = rect.top + a.y * k + (a.dy || 0) - 14;
+      if (left + POPW > window.innerWidth - M) left = boxL - POPW - 16;
+      if (left < M) left = Math.max(M, window.innerWidth - POPW - M);
       if (top + POPH > window.innerHeight - M) top = window.innerHeight - POPH - M;
       if (top < M) top = M;
     } else { left = window.innerWidth - POPW - M; top = 120; }
     setCommentPos({ left, top });
   };
+  // Scroll the page so the annotation is on screen (like clicking a comment in Acrobat).
+  const scrollAnnotationIntoView = (ann) => {
+    const rect = overlayRef.current?.getBoundingClientRect();
+    if (!rect || !rect.width) return;
+    const k = pageBase ? rect.width / pageBase.w : scale;
+    const ay = rect.top + noteAnchor(ann).y * k + (noteAnchor(ann).dy || 0);
+    if (ay > 90 && ay < window.innerHeight - 120) return;
+    const delta = ay - window.innerHeight / 2.6;
+    const sp = getScrollParent(overlayRef.current);
+    if (sp) sp.scrollTop += delta; else window.scrollBy(0, delta);
+  };
   const openCommentPopup = (ann) => {
+    if (ann.type === "reply") ann = annotations.find(a => a.id === ann.parentId) || ann;
     if (ann.page !== currentPage) setCurrentPage(ann.page);
     setSelected(ann.id);
     placeCommentPopup(ann);
     setActiveComment(ann.id);
-    setTimeout(() => { placeCommentPopup(ann); commentInputRef.current?.focus(); }, 60);
+    setTimeout(() => {
+      scrollAnnotationIntoView(ann);
+      placeCommentPopup(ann);
+      const el = commentInputRef.current;
+      if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) {} }
+    }, ann.page !== currentPage ? 160 : 30);
   };
   const closeCommentPopup = () => {
     setActiveComment(null);
@@ -754,6 +948,55 @@ function PDFEditor({ pdfLib }) {
 
   // Panel click → navigate to the annotation and open its note.
   const goToAnnotation = (ann) => openCommentPopup(ann);
+
+  // Delete an annotation together with its replies.
+  const removeAnnotation = (id) => {
+    pushHistory(annotations.filter(a => a.id !== id && a.parentId !== id));
+    if (selected === id) setSelected(null);
+    if (activeComment === id) setActiveComment(null);
+  };
+
+  // Keep the selected comment's card visible in the panel (like Acrobat).
+  useEffect(() => {
+    const id = activeComment ?? selected;
+    const list = panelListRef.current;
+    if (id == null || !list) return;
+    const card = [...list.querySelectorAll("[data-ann]")].find(el => el.dataset.ann === String(id));
+    if (!card) return;
+    const lb = list.getBoundingClientRect(), cb = card.getBoundingClientRect();
+    if (cb.top < lb.top + 4 || cb.bottom > lb.bottom - 4) list.scrollTop += cb.top - lb.top - lb.height / 3;
+  }, [activeComment, selected]);
+
+  // Keep the popup glued to its marker while the page scrolls or the window resizes.
+  useEffect(() => {
+    if (activeComment == null) return;
+    const onMove = () => {
+      const a = annotations.find(x => x.id === activeComment);
+      if (a) placeCommentPopup(a);
+    };
+    window.addEventListener("scroll", onMove, true);
+    window.addEventListener("resize", onMove);
+    return () => { window.removeEventListener("scroll", onMove, true); window.removeEventListener("resize", onMove); };
+  }, [activeComment, annotations, pageBase, scale]);
+
+  // Imported notes that were deleted are hidden on the canvas immediately
+  // (pdf.js annotation storage `noView`), not only after saving.
+  useEffect(() => {
+    const doc = pdfJsDocRef.current;
+    if (!doc || !doc.annotationStorage) return;
+    const present = new Set(annotations.map(a => a.id));
+    let changed = false;
+    for (const imp of importedRef.current) {
+      if (!imp.pdfjsId) continue;
+      const hide = !present.has(imp.id);
+      if (hide !== hiddenRef.current.has(imp.pdfjsId)) {
+        changed = true;
+        if (hide) hiddenRef.current.add(imp.pdfjsId); else hiddenRef.current.delete(imp.pdfjsId);
+        try { doc.annotationStorage.setValue(imp.pdfjsId, { noView: hide }); } catch (_) {}
+      }
+    }
+    if (changed) setStorageVersion(v => v + 1);
+  }, [annotations]);
 
   const canvasRef    = useRef();
   const overlayRef   = useRef();
@@ -838,8 +1081,9 @@ function PDFEditor({ pdfLib }) {
     let finalAnns = null;
 
     const handleMouseMove = (e) => {
-      const deltaX = e.clientX - resizeData.startX;
-      const deltaY = e.clientY - resizeData.startY;
+      // Mouse deltas are screen px; annotations live in page units.
+      const deltaX = (e.clientX - resizeData.startX) / scale;
+      const deltaY = (e.clientY - resizeData.startY) / scale;
 
       const { handle, startRect } = resizeData;
       let newX = startRect.x;
@@ -847,7 +1091,6 @@ function PDFEditor({ pdfLib }) {
       let newW = startRect.w;
       let newH = startRect.h;
 
-      // Canvas coordinates map 1:1 to screen pixels, so apply the delta directly
       switch(handle) {
         // CORNERS - resize both axes
         case 'br': newW += deltaX; newH += deltaY; break;
@@ -862,7 +1105,7 @@ function PDFEditor({ pdfLib }) {
       }
 
       // Enforce minimum size
-      const minSize = 15;
+      const minSize = 6;
       if (newW < minSize) {
         if (['l', 'tl', 'bl'].includes(handle)) newX = startRect.x + startRect.w - minSize;
         newW = minSize;
@@ -872,8 +1115,9 @@ function PDFEditor({ pdfLib }) {
         newH = minSize;
       }
 
-      newX = Math.round(newX); newY = Math.round(newY);
-      newW = Math.round(newW); newH = Math.round(newH);
+      const r2 = (v) => Math.round(v * 100) / 100;
+      newX = r2(newX); newY = r2(newY);
+      newW = r2(newW); newH = r2(newH);
 
       // Live update without recording history on every frame
       setAnnotations(prev => {
@@ -899,7 +1143,7 @@ function PDFEditor({ pdfLib }) {
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isResizing, resizeData, selected]);
+  }, [isResizing, resizeData, selected, scale]);
 
   useEffect(() => {
     if (window.pdfjsLib) { pdfJsRef.current = window.pdfjsLib; return; }
@@ -930,6 +1174,8 @@ function PDFEditor({ pdfLib }) {
 
   const loadPDF = async (f) => {
     setLoading(true); setError(""); setAnnotations([]); setHistory([[]]); setHistoryIdx(0); setSaveResult(null);
+    historyIdxRef.current = 0; setSelected(null); setActiveComment(null);
+    importedRef.current = []; hiddenRef.current = new Set();
     setFile(f);
     try {
       const ab = await f.arrayBuffer();
@@ -942,39 +1188,16 @@ function PDFEditor({ pdfLib }) {
       const doc = await pdfLib.PDFDocument.load(arrForPdfLib);
       setPdfDoc(doc);
 
-      // Read notes already embedded in the PDF (highlight pop-ups, sticky notes,
-      // free-text …) straight from pdf-lib, keeping each one's exact annotation
-      // index so its text can later be edited in place — no duplication.
+      // Read notes already embedded in the PDF (Acrobat highlights with notes,
+      // sticky notes, replies …). pdf-lib gives each one's exact index in the
+      // page's /Annots (so it can be edited/removed in place on save); the
+      // pdf.js viewport converts its geometry to page units, honouring the
+      // CropBox offset and page rotation, so markers land on the right words.
       const existingNotes = [];
       try {
-        const { PDFName, PDFDict, PDFArray } = pdfLib;
-        doc.getPages().forEach((page, pageIdx) => {
-          const annots = page.node.Annots && page.node.Annots();
-          if (!annots) return;
-          const pageH = page.getSize().height;
-          for (let i = 0; i < annots.size(); i++) {
-            let d; try { d = annots.lookup(i, PDFDict); } catch (_) { continue; }
-            if (!d) continue;
-            const sub = d.get(PDFName.of("Subtype"));
-            const subStr = sub ? sub.toString() : "";          // e.g. "/Highlight"
-            const c = d.get(PDFName.of("Contents"));
-            let text = "";
-            try { if (c && c.decodeText) text = c.decodeText(); } catch (_) {}
-            if (!text || !text.trim()) continue;                // only annotations with a note
-            let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-            try {
-              const rect = d.lookup(PDFName.of("Rect"), PDFArray);
-              if (rect) { x1 = rect.lookup(0).asNumber(); y1 = rect.lookup(1).asNumber(); x2 = rect.lookup(2).asNumber(); y2 = rect.lookup(3).asNumber(); }
-            } catch (_) {}
-            const cx = Math.min(x1, x2) * scale, cyTop = (pageH - Math.max(y1, y2)) * scale;
-            existingNotes.push({
-              id:`pdfnote-${pageIdx}-${i}`, page:pageIdx, type:"note", existing:true, annotIndex:i,
-              x:cx, y:cyTop, w:Math.max(12, Math.abs(x2 - x1) * scale), h:Math.max(12, Math.abs(y2 - y1) * scale),
-              comment:text.trim(), origComment:text.trim(), subtype:subStr,
-            });
-          }
-        });
+        existingNotes.push(...await readPdfNotes(pdfLib, doc, pdfJsDocRef.current));
       } catch (_) { /* annotations are optional — ignore read errors */ }
+      importedRef.current = existingNotes.map(n => ({ id:n.id, page:n.page, annotIndex:n.annotIndex, popupIndex:n.popupIndex, pdfjsId:n.pdfjsId }));
       if (existingNotes.length) {
         setAnnotations(existingNotes);
         setHistory([existingNotes]);
@@ -992,32 +1215,44 @@ function PDFEditor({ pdfLib }) {
     if (!pdfJsDocRef.current || !canvasRef.current) return;
     const page   = await pdfJsDocRef.current.getPage(pageIdx + 1);
     const vp     = page.getViewport({ scale });
+    const vp1    = page.getViewport({ scale: 1 });
     const canvas = canvasRef.current;
+    if (!canvas) return;
+    // Only one render may draw into the canvas at a time (fast zoom/page clicks).
+    if (renderTaskRef.current) { try { renderTaskRef.current.cancel(); } catch (_) {} }
     // Render at device-pixel resolution for crisp, Adobe-quality text and
-    // highlights on HiDPI/Retina screens, but keep the CSS size in logical
-    // pixels so annotation coordinates (stored in CSS px) stay aligned.
+    // highlights on HiDPI/Retina screens; the CSS size stays in logical px.
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
     canvas.width  = Math.floor(vp.width  * dpr);
     canvas.height = Math.floor(vp.height * dpr);
     canvas.style.width  = vp.width  + "px";
     canvas.style.height = vp.height + "px";
+    setPageBase({ w: vp1.width, h: vp1.height });
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    await page.render({
+    const AM = pdfJsRef.current?.AnnotationMode;
+    const task = page.render({
       canvasContext: ctx,
       viewport: vp,
       transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
-    }).promise;
+      // ENABLE_STORAGE lets deleted imported notes be hidden before saving.
+      ...(AM ? { annotationMode: AM.ENABLE_STORAGE } : {}),
+    });
+    renderTaskRef.current = task;
+    try { await task.promise; } catch (_) { /* cancelled by a newer render */ }
+    if (renderTaskRef.current === task) renderTaskRef.current = null;
   }, [scale]);
 
-  useEffect(() => { renderPage(currentPage); }, [currentPage, scale, renderPage, docVersion]);
+  useEffect(() => { renderPage(currentPage); }, [currentPage, scale, renderPage, docVersion, storageVersion]);
 
+  // Mouse position in PAGE units (independent of zoom).
   const getCanvasPos = (e) => {
     const rect = overlayRef.current.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const k = pageBase && rect.width ? pageBase.w / rect.width : 1 / scale;
+    return { x: (e.clientX - rect.left) * k, y: (e.clientY - rect.top) * k };
   };
 
-  const pageAnnotations = annotations.filter(a => a.page === currentPage);
+  const pageAnnotations = annotations.filter(a => a.page === currentPage && a.type !== "reply");
 
   const onMouseDown = (e) => {
     const pos = getCanvasPos(e);
@@ -1030,8 +1265,10 @@ function PDFEditor({ pdfLib }) {
       });
       if (hit) {
         setSelected(hit.id);
-        dragAnnRef.current = hit.id;
-        dragOffRef.current = { x: pos.x - hit.x, y: pos.y - hit.y };
+        if (!hit.existing) {                 // imported PDF notes are fixed to their text
+          dragAnnRef.current = hit.id;
+          dragOffRef.current = { x: pos.x - hit.x, y: pos.y - hit.y };
+        }
       } else setSelected(null);
       return;
     }
@@ -1108,6 +1345,7 @@ function PDFEditor({ pdfLib }) {
           fillShape: editMode === "rect" ? fillShape : false,
           fillColor: editMode === "rect" ? fontColor : undefined,
           color: editMode === "redact" ? redactColor : editMode === "highlight" ? highlightColor : undefined,
+          date: Date.now(),
         };
         pushHistory([...annotations, newAnn]);
         if (editMode === "highlight") setSelected(newAnn.id);   // reveal the note badge immediately
@@ -1130,7 +1368,7 @@ function PDFEditor({ pdfLib }) {
 
   const confirmSig = ({ dataUrl, ratio }) => {
     if (!pendingSigPos) return;
-    const w = 190;                                  // default on-page width
+    const w = 160;                                  // default on-page width (page units ≈ pt)
     const h = Math.round(w / (ratio || 2.4));       // preserve the signature's true proportions
     pushHistory([...annotations, {
       id: Date.now(), page: currentPage, type: "image",
@@ -1148,8 +1386,7 @@ function PDFEditor({ pdfLib }) {
 
   const deleteSelected = () => {
     if (!selected) return;
-    pushHistory(annotations.filter(a => a.id !== selected));
-    setSelected(null);
+    removeAnnotation(selected);
   };
 
   // Insert a Greek/science symbol. Rendered to a transparent PNG (so it exports
@@ -1186,12 +1423,24 @@ function PDFEditor({ pdfLib }) {
     if (!pdfDoc) return;
     setSaving(true);
     try {
-      const { rgb, StandardFonts, PDFName, PDFNumber, PDFArray, PDFDict, PDFHexString, PDFRawStream, PDFBool } = pdfLib;
+      const { rgb, StandardFonts, PDFName, PDFNumber, PDFArray, PDFDict, PDFHexString, PDFString, PDFRawStream, PDFBool, PDFRef } = pdfLib;
       // Re-load the ORIGINAL file for every save so output never accumulates
       // duplicate annotations or re-stamped drawings across repeated saves.
       const doc   = file ? await pdfLib.PDFDocument.load(await file.arrayBuffer()) : pdfDoc;
       const pages = doc.getPages();
       const ctx   = doc.context;
+
+      // Page units → PDF user space, through the same pdf.js viewport used for
+      // display (handles CropBox offsets and rotated pages).
+      const vps = {};
+      for (const p of new Set(annotations.map(a => a.page))) {
+        try { vps[p] = (await pdfJsDocRef.current.getPage(p + 1)).getViewport({ scale: 1 }); } catch (_) {}
+      }
+      const toPdf = (pi, x, y) => vps[pi] ? vps[pi].convertToPdfPoint(x, y) : [x, pages[pi].getSize().height - y];
+      const boxToPdf = (pi, x, y, w, h) => {
+        const [ax, ay] = toPdf(pi, x, y), [bx, by] = toPdf(pi, x + w, y + h);
+        return { x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay) };
+      };
 
       const hexToRgb = hex => {
         const r = parseInt(hex.slice(1,3),16)/255;
@@ -1205,9 +1454,8 @@ function PDFEditor({ pdfLib }) {
       // A Highlight markup annotation with QuadPoints, colour, an appearance
       // stream (so every viewer renders it) and the note in /Contents.
       const addHighlightAnnot = (page, ann) => {
-        const { height } = page.getSize();
-        const x1 = ann.x / scale, x2 = (ann.x + ann.w) / scale;
-        const y2 = height - ann.y / scale, y1 = height - (ann.y + ann.h) / scale;
+        const b = boxToPdf(ann.page, ann.x, ann.y, ann.w, ann.h);
+        const x1 = b.x, x2 = b.x + b.w, y1 = b.y, y2 = b.y + b.h;
         const w = Math.max(1, x2 - x1), h = Math.max(1, y2 - y1);
         const m = (ann.color || "rgba(255,230,0,0.45)").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
         const cr = m ? +m[1]/255 : 1, cg = m ? +m[2]/255 : 0.9, cb = m ? +m[3]/255 : 0;
@@ -1240,14 +1488,14 @@ function PDFEditor({ pdfLib }) {
         annot.set(PDFName.of("CA"), PDFNumber.of(ca));
         annot.set(PDFName.of("F"), PDFNumber.of(4));
         annot.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+        annot.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
         if (ann.comment) annot.set(PDFName.of("Contents"), PDFHexString.fromText(ann.comment));
         annot.set(PDFName.of("AP"), apN);
         page.node.addAnnot(ctx.register(annot));
       };
       // A Text (sticky-note) annotation carrying a comment on a non-highlight item.
       const addTextNote = (page, ann) => {
-        const { height } = page.getSize();
-        const x = ann.x / scale, y = height - ann.y / scale;
+        const [x, y] = toPdf(ann.page, ann.x, ann.y);
         const annot = PDFDict.withContext(ctx);
         annot.set(PDFName.of("Type"), PDFName.of("Annot"));
         annot.set(PDFName.of("Subtype"), PDFName.of("Text"));
@@ -1256,6 +1504,7 @@ function PDFEditor({ pdfLib }) {
         annot.set(PDFName.of("F"), PDFNumber.of(4));
         annot.set(PDFName.of("Open"), PDFBool.False);
         annot.set(PDFName.of("T"), PDFHexString.fromText("PDF Tools"));
+        annot.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
         annot.set(PDFName.of("Contents"), PDFHexString.fromText(ann.comment || ""));
         page.node.addAnnot(ctx.register(annot));
       };
@@ -1276,41 +1525,48 @@ function PDFEditor({ pdfLib }) {
         return fontMap[key] || fontMap[fo.pdfLib] || fontMap["Helvetica"];
       };
 
-      // ── Imported notes: edit in place (update text, or remove if cleared) ──
-      // Each carries the exact annotation index it was read from, so we edit the
-      // original annotation rather than adding a duplicate.
-      const noteRemovals = [];
-      for (const ann of annotations) {
-        if (!ann.existing || typeof ann.annotIndex !== "number") continue;
+      // ── Imported notes: edit in place, delete removed ones ──
+      // Each carries the exact /Annots index it was read from (in the original
+      // file, which is re-loaded above), so the original annotation is updated
+      // rather than duplicated. A note deleted in the app is removed together
+      // with its pop-up window; clearing a note's text keeps the highlight.
+      const present = new Map(annotations.filter(a => a.existing).map(a => [a.id, a]));
+      const removals = new Map();   // page index → Set of /Annots indices
+      const markRemove = (pi, idx) => { if (typeof idx !== "number") return; if (!removals.has(pi)) removals.set(pi, new Set()); removals.get(pi).add(idx); };
+      for (const imp of importedRef.current) {
+        const ann = present.get(imp.id);
+        if (!ann) { markRemove(imp.page, imp.annotIndex); markRemove(imp.page, imp.popupIndex); continue; }
+        const text = (ann.comment || "").trim();
+        if (text === (ann.origComment || "")) continue;
         try {
-          const page = pages[ann.page];
-          const annots = page.node.Annots && page.node.Annots();
-          if (!annots || ann.annotIndex >= annots.size()) continue;
-          const text = (ann.comment || "").trim();
-          if (!text) {
-            noteRemovals.push({ annots, idx: ann.annotIndex });     // cleared → drop it
-          } else if (text !== (ann.origComment || "")) {
-            const d = annots.lookup(ann.annotIndex, PDFDict);
-            if (d) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));  // edited → update text
-          }
-        } catch (_) { /* leave original untouched on any error */ }
+          const annots = pages[imp.page].node.Annots && pages[imp.page].node.Annots();
+          const d = annots && annots.lookup(imp.annotIndex, PDFDict);
+          if (!d) continue;
+          if (text) d.set(PDFName.of("Contents"), PDFHexString.fromText(text));
+          else d.delete(PDFName.of("Contents"));
+          d.set(PDFName.of("M"), PDFString.of(pdfDateNow()));
+        } catch (_) { /* leave the original untouched on any error */ }
       }
-      // Remove cleared notes highest-index-first so earlier indices stay valid.
-      noteRemovals.sort((a, b) => b.idx - a.idx);
-      for (const r of noteRemovals) {
-        try { const ref = r.annots.get(r.idx); r.annots.remove(r.idx); if (ref) { try { ctx.delete(ref); } catch (_) {} } } catch (_) {}
+      // Remove highest-index-first so earlier indices stay valid.
+      for (const [pi, set] of removals) {
+        const annots = pages[pi].node.Annots && pages[pi].node.Annots();
+        if (!annots) continue;
+        for (const idx of [...set].sort((a, b) => b - a)) {
+          if (idx >= annots.size()) continue;
+          try { const ref = annots.get(idx); annots.remove(idx); if (ref instanceof PDFRef) { try { ctx.delete(ref); } catch (_) {} } } catch (_) {}
+        }
       }
 
       for (const ann of annotations) {
         const page = pages[ann.page];
-        const { height } = page.getSize();
-        const pdfY = (y) => height - y / scale;
+        if (!page || ann.type === "reply" || ann.type === "note") continue;
+        const P = (x, y) => toPdf(ann.page, x, y);
+        const B = () => boxToPdf(ann.page, ann.x, ann.y, ann.w, ann.h);
 
         if (ann.type === "text" && ann.text) {
           const f = pickFont(ann);
-          const textSize = ann.fontSize / scale * 1.1;
-          const textX = ann.x / scale;
-          const textY = pdfY(ann.y);
+          const textSize = ann.fontSize * 1.1;
+          const [textX, textY] = P(ann.x, ann.y);
           page.drawText(ann.text, {
             x: textX, y: textY,
             size: textSize,
@@ -1330,7 +1586,8 @@ function PDFEditor({ pdfLib }) {
         }
         if (ann.type === "redact") {
           const rc = ann.color === "white" ? rgb(1,1,1) : rgb(0,0,0);
-          page.drawRectangle({ x: ann.x/scale, y: pdfY(ann.y+ann.h), width: ann.w/scale, height: ann.h/scale, color: rc });
+          const b = B();
+          page.drawRectangle({ x: b.x, y: b.y, width: b.w, height: b.h, color: rc });
         }
         if (ann.existing) continue;   // already in the PDF (pdf-lib preserves it) — don't duplicate
         if (ann.type === "highlight") {
@@ -1341,7 +1598,8 @@ function PDFEditor({ pdfLib }) {
         if (["rect","circle","triangle","arrow","arrowUp","star","diamond","line","dblArrow","callout","checkmark","cross"].includes(ann.type)) {
           const shSc = hexToRgb(ann.strokeColor || "#000000");
           const shFc = ann.fillShape ? hexToRgb(ann.fillColor || ann.strokeColor || "#000000") : undefined;
-          const shX = ann.x/scale, shY = pdfY(ann.y+ann.h), shW = ann.w/scale, shH = ann.h/scale;
+          const shB = B();
+          const shX = shB.x, shY = shB.y, shW = shB.w, shH = shB.h;
           const shCx = shX+shW/2, shCy = shY+shH/2, shBw = ann.strokeWidth || 1.5;
           const pt = (px,py) => ({x:px, y:py});
 
@@ -1396,7 +1654,8 @@ function PDFEditor({ pdfLib }) {
         }
         if (ann.type === "sign" && ann.points?.length > 1) {
           for (let i = 0; i < ann.points.length - 1; i++) {
-            page.drawLine({ start: { x: ann.points[i].x/scale, y: pdfY(ann.points[i].y) }, end: { x: ann.points[i+1].x/scale, y: pdfY(ann.points[i+1].y) }, thickness: 1.5, color: rgb(0,0,0.7) });
+            const [sx, sy] = P(ann.points[i].x, ann.points[i].y), [ex, ey] = P(ann.points[i+1].x, ann.points[i+1].y);
+            page.drawLine({ start: { x: sx, y: sy }, end: { x: ex, y: ey }, thickness: 1.5, color: rgb(0,0,0.7) });
           }
         }
         if (ann.type === "image" && ann.src) {
@@ -1418,11 +1677,8 @@ function PDFEditor({ pdfLib }) {
             const bytes2 = new Uint8Array(raw.length);
             for (let i = 0; i < raw.length; i++) bytes2[i] = raw.charCodeAt(i);
             const embeddedImg = await doc.embedPng(bytes2);
-            page.drawImage(embeddedImg, {
-              x: ann.x / scale, y: pdfY(ann.y + ann.h),
-              width:  ann.w / scale,
-              height: ann.h / scale,
-            });
+            const ib = B();
+            page.drawImage(embeddedImg, { x: ib.x, y: ib.y, width: ib.w, height: ib.h });
           } catch (_) { /* skip unembeddable images */ }
         }
       }
@@ -1430,7 +1686,7 @@ function PDFEditor({ pdfLib }) {
       // Persist comments attached to non-highlight items (shapes, images, symbols)
       // as Adobe sticky-note annotations so they survive save/reopen too.
       for (const ann of annotations) {
-        if (ann.existing || ann.type === "highlight") continue;
+        if (ann.existing || ann.type === "highlight" || ann.type === "reply") continue;
         if (ann.comment && ann.comment.trim()) {
           try { addTextNote(pages[ann.page], ann); } catch (_) {}
         }
@@ -1445,6 +1701,18 @@ function PDFEditor({ pdfLib }) {
   };
 
   const activeCursor = editMode === "select" ? "default" : editMode === "sign" ? "crosshair" : editMode === "addText" ? "text" : "crosshair";
+  // 1 screen px expressed in page units — for UI chrome (markers, outlines)
+  // that should keep a constant on-screen size at every zoom level.
+  const ui = 1 / scale;
+  // Comment marker (speech-bubble badge) centred on (x, y), in page units.
+  // dx: extra on-screen offset (px) so the marker sits just past the end of
+  // the line instead of on the text or on a resize handle.
+  const noteBadge = (x, y, filled, dx = 0, dy = 0) => (
+    <g transform={`translate(${x} ${y}) scale(${ui}) translate(${dx} ${dy})`}>
+      <circle r={9} fill={filled ? "#D81F3F" : "#ffffff"} stroke={filled ? "#ffffff" : "#D81F3F"} strokeWidth={1.6} style={{ filter:"drop-shadow(0 1px 1.5px rgba(0,0,0,.35))" }}/>
+      <path d="M-4.2,-2.6 h8.4 M-4.2,0.2 h8.4 M-4.2,3 h5.2" stroke={filled ? "#fff" : "#D81F3F"} strokeWidth={1.2} strokeLinecap="round" pointerEvents="none"/>
+    </g>
+  );
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:"0", height:"100%" }}>
@@ -1538,7 +1806,7 @@ function PDFEditor({ pdfLib }) {
           {/* Font size */}
           <select value={fontSize} onChange={e => setFontSize(+e.target.value)}
             style={{ ...miniInput, width:"72px", cursor:"pointer" }}>
-            {FONT_SIZES.map(s => <option key={s} value={s}>{s}px</option>)}
+            {FONT_SIZES.map(s => <option key={s} value={s}>{s}pt</option>)}
           </select>
 
           {/* Bold */}
@@ -1965,12 +2233,14 @@ function PDFEditor({ pdfLib }) {
           <div style={{ position:"relative", display:"inline-block", lineHeight:0, border:"1px solid rgba(0,0,0,.08)", borderRadius:"4px", overflow:"hidden", alignSelf:"flex-start", boxShadow:"0 1px 3px rgba(0,0,0,.10), 0 8px 24px rgba(0,0,0,.06)" }}>
             <canvas ref={canvasRef} style={{ display:"block" }} />
             <svg ref={overlayRef}
-              style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", cursor:activeCursor }}
+              viewBox={pageBase ? `0 0 ${pageBase.w} ${pageBase.h}` : undefined}
+              preserveAspectRatio="none"
+              style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", cursor:activeCursor, overflow:"visible" }}
               onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
 
               {pageAnnotations.map(ann => {
-                const sel = selected === ann.id;
-                const dash = sel ? "6,3" : "0";
+                const sel = selected === ann.id || activeComment === ann.id;
+                const dash = sel ? `${6*ui},${3*ui}` : "0";
                 const selStroke = sel ? "#D81F3F" : "none";
 
                 if (ann.type === "redact") return (
@@ -1978,47 +2248,53 @@ function PDFEditor({ pdfLib }) {
                     <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h}
                       fill={ann.color === "white" ? "#ffffff" : "#000000"}
                       stroke={sel ? "#D81F3F" : ann.color === "white" ? "#aaa" : "none"}
-                      strokeWidth={sel?2:1} strokeDasharray={dash} />
-                    {sel && <text x={ann.x + ann.w/2} y={ann.y + ann.h/2 + 5} textAnchor="middle"
-                      fontSize="11" fill={ann.color === "white" ? "#666" : "#fff"} fontFamily="sans-serif">
+                      strokeWidth={(sel?2:1)*ui} strokeDasharray={dash} />
+                    {sel && <text x={ann.x + ann.w/2} y={ann.y + ann.h/2 + 4*ui} textAnchor="middle"
+                      fontSize={11*ui} fill={ann.color === "white" ? "#666" : "#fff"} fontFamily="sans-serif">
                       {ann.color === "white" ? "White Cover" : "Black Redact"}
                     </text>}
                   </g>
                 );
-                if (ann.type === "note") return (
-                  <g key={ann.id} style={{ cursor:"pointer" }}
-                     onMouseDown={(e)=>e.stopPropagation()}
-                     onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
-                    {/* transparent hit area over the annotated region */}
-                    <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h} fill="transparent"
-                      stroke={sel ? "#D81F3F" : "transparent"} strokeWidth={1.2} strokeDasharray="4,3"/>
-                    {/* comment icon badge */}
-                    <circle cx={ann.x} cy={ann.y} r={8.5} fill="#D81F3F" stroke="#fff" strokeWidth={1.5}/>
-                    <path d={`M${ann.x-4},${ann.y-2.2} h8 M${ann.x-4},${ann.y+0.6} h8 M${ann.x-4},${ann.y+3.4} h5`} stroke="#fff" strokeWidth={1.1} strokeLinecap="round"/>
-                    <title>{ann.comment}</title>
-                  </g>
-                );
+                if (ann.type === "note") {
+                  // A note read from the PDF. The highlight itself is drawn by pdf.js
+                  // on the canvas; here: a hit area over each highlighted line + marker.
+                  const boxes = ann.quads && ann.quads.length ? ann.quads : [ann];
+                  const tip = [ann.author, ann.comment].filter(Boolean).join(": ");
+                  return (
+                    <g key={ann.id} style={{ cursor:"pointer" }} className="pdfnote"
+                       onMouseDown={(e)=>e.stopPropagation()}
+                       onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
+                      {boxes.map((q, qi) => (
+                        <rect key={qi} x={q.x} y={q.y} width={q.w} height={q.h}
+                          fill={sel ? "rgba(216,31,63,.10)" : "transparent"}
+                          stroke={sel ? "#D81F3F" : "transparent"} strokeWidth={1.2*ui} strokeDasharray={`${4*ui},${3*ui}`}/>
+                      ))}
+                      {ann.comment || annotations.some(r => r.parentId === ann.id) ? noteBadge(ann.bx ?? ann.x, ann.by ?? ann.y, true, ann.bdx || 0, ann.bdy || 0) : null}
+                      <title>{tip || "Comment"}</title>
+                    </g>
+                  );
+                }
                 if (ann.type === "highlight") return (
                   <g key={ann.id} onDoubleClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
                     <rect x={ann.x} y={ann.y} width={ann.w} height={ann.h}
-                      fill={ann.color || "rgba(255,230,0,.45)"} stroke={selStroke} strokeWidth={sel?2:0} strokeDasharray={dash}>
+                      fill={ann.color || "rgba(255,230,0,.45)"} stroke={selStroke} strokeWidth={sel?1.5*ui:0} strokeDasharray={dash}
+                      style={{ mixBlendMode:"multiply" }}>
                       {ann.comment ? <title>{ann.comment}</title> : null}
                     </rect>
-                    {/* Note button — click to add/read a comment (filled when a note exists).
+                    {/* Note marker — click to add/read a comment (filled when a note exists).
                         Shown when the highlight is selected or already has a note. */}
                     {(sel || ann.comment) && (
                       <g style={{ cursor:"pointer" }}
                          onMouseDown={(e)=>e.stopPropagation()}
                          onClick={(e)=>{ e.stopPropagation(); openCommentPopup(ann); }}>
-                        <circle cx={ann.x + ann.w} cy={ann.y} r={8} fill={ann.comment ? "#D81F3F" : "#ffffff"} stroke="#D81F3F" strokeWidth={1.5}/>
-                        <path d={`M${ann.x+ann.w-3.5},${ann.y-1.6} h7 M${ann.x+ann.w-3.5},${ann.y+1.6} h7`} stroke={ann.comment ? "#fff" : "#D81F3F"} strokeWidth={1.2} strokeLinecap="round"/>
+                        {(() => { const a = noteAnchor(ann); return noteBadge(a.x, a.y, !!ann.comment, a.dx); })()}
                       </g>
                     )}
                   </g>
                 );
                 if (["rect","circle","triangle","arrow","arrowUp","star","diamond","line","dblArrow","callout","checkmark","cross"].includes(ann.type)) {
                   const sc = sel ? "#D81F3F" : (ann.strokeColor || "#000");
-                  const sw = sel ? 2 : (ann.strokeWidth || 1.5);
+                  const sw = ann.strokeWidth || 1.5;
                   const fc = ann.fillShape ? (ann.fillColor || ann.strokeColor || "#000") : "transparent";
                   const cx = ann.x + ann.w/2, cy = ann.y + ann.h/2;
                   const w = ann.w, h = ann.h;
@@ -2092,14 +2368,14 @@ function PDFEditor({ pdfLib }) {
                     </g>;
                   }
 
-                  return <g key={ann.id}>{shape}{sel && <rect x={ann.x-3} y={ann.y-3} width={w+6} height={h+6} fill="none" stroke="#D81F3F" strokeWidth={1} strokeDasharray="5,3" rx={2}/>}</g>;
+                  return <g key={ann.id}>{shape}{sel && <rect x={ann.x-3*ui} y={ann.y-3*ui} width={w+6*ui} height={h+6*ui} fill="none" stroke="#D81F3F" strokeWidth={ui} strokeDasharray={`${5*ui},${3*ui}`} rx={2*ui}/>}</g>;
                 }
                 if (ann.type === "text") {
                   const lines = ann.text.split("\n");
                   const lh = ann.fontSize * 1.3;
                   return (
                     <g key={ann.id}>
-                      {sel && <rect x={ann.x-4} y={ann.y-ann.fontSize-4} width={Math.max(...lines.map(l=>l.length))*ann.fontSize*0.6+8} height={lines.length*lh+8} fill="rgba(216,31,63,.08)" stroke="#D81F3F" strokeWidth={1} strokeDasharray="5,3" rx={3}/>}
+                      {sel && <rect x={ann.x-4*ui} y={ann.y-ann.fontSize-4*ui} width={Math.max(...lines.map(l=>l.length))*ann.fontSize*0.6+8*ui} height={lines.length*lh+8*ui} fill="rgba(216,31,63,.08)" stroke="#D81F3F" strokeWidth={ui} strokeDasharray={`${5*ui},${3*ui}`} rx={3*ui}/>}
                       {lines.map((line, li) => (
                         <text key={li} x={ann.x} y={ann.y + li*lh}
                           fontSize={ann.fontSize} fill={ann.color||"#000"}
@@ -2118,17 +2394,27 @@ function PDFEditor({ pdfLib }) {
                   return (
                     <g key={ann.id}>
                       <image href={ann.src} x={ann.x} y={ann.y} width={ann.w} height={ann.h} preserveAspectRatio="xMidYMid meet"/>
-                      {sel && <rect x={ann.x-2} y={ann.y-2} width={ann.w+4} height={ann.h+4}
-                        fill="none" stroke="#D81F3F" strokeWidth={2} strokeDasharray="6,3"/>}
+                      {sel && <rect x={ann.x-2*ui} y={ann.y-2*ui} width={ann.w+4*ui} height={ann.h+4*ui}
+                        fill="none" stroke="#D81F3F" strokeWidth={2*ui} strokeDasharray={`${6*ui},${3*ui}`}/>}
                     </g>
                   );
                 }
                 if (ann.type === "sign" && ann.points) {
                   const d = ann.points.map((p,i)=>`${i===0?"M":"L"}${p.x},${p.y}`).join(" ");
-                  return <path key={ann.id} d={d} fill="none" stroke={sel?"#D81F3F":"#003080"} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"/>;
+                  return <path key={ann.id} d={d} fill="none" stroke={sel?"#D81F3F":"#003080"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>;
                 }
                 return null;
               })}
+
+              {/* Comment markers of shapes / images / symbols that carry a note */}
+              {pageAnnotations.filter(a => a.comment && a.type !== "note" && a.type !== "highlight" && typeof a.w === "number").map(a => (
+                <g key={"nb-"+a.id} style={{ cursor:"pointer" }}
+                   onMouseDown={(e)=>e.stopPropagation()}
+                   onClick={(e)=>{ e.stopPropagation(); openCommentPopup(a); }}>
+                  {noteBadge(a.x + a.w, a.y, true, BADGE_DX)}
+                  <title>{a.comment}</title>
+                </g>
+              ))}
 
               {/* Image placement preview — show where it will land before Place is clicked */}
               {editMode === "image" && imagePlacedPos && imageDataUrl && (
@@ -2137,15 +2423,15 @@ function PDFEditor({ pdfLib }) {
                     x={imagePlacedPos.x - imageDispW/2} y={imagePlacedPos.y - imageDispH/2}
                     width={imageDispW} height={imageDispH}
                     preserveAspectRatio="xMidYMid meet"/>
-                  <rect x={imagePlacedPos.x - imageDispW/2 - 2} y={imagePlacedPos.y - imageDispH/2 - 2}
-                    width={imageDispW+4} height={imageDispH+4}
-                    fill="none" stroke="#D81F3F" strokeWidth={1.5} strokeDasharray="6,3"/>
+                  <rect x={imagePlacedPos.x - imageDispW/2 - 2*ui} y={imagePlacedPos.y - imageDispH/2 - 2*ui}
+                    width={imageDispW+4*ui} height={imageDispH+4*ui}
+                    fill="none" stroke="#D81F3F" strokeWidth={1.5*ui} strokeDasharray={`${6*ui},${3*ui}`}/>
                 </g>
               )}
               {/* Crosshair when pos not yet set */}
               {editMode === "image" && !imagePlacedPos && (
                 <text x="50%" y="50%" textAnchor="middle" dominantBaseline="middle"
-                  fontSize="13" fill="rgba(216,31,63,.4)" fontFamily="sans-serif">
+                  fontSize={13*ui} fill="rgba(216,31,63,.4)" fontFamily="sans-serif">
                   Click here to set image position
                 </text>
               )}
@@ -2154,7 +2440,7 @@ function PDFEditor({ pdfLib }) {
                   {editMode !== "image" && (
                     <rect x={tempRect.x} y={tempRect.y} width={tempRect.w} height={tempRect.h}
                       fill={editMode==="highlight"?(highlightColor||"rgba(255,230,0,.35)"):editMode==="redact"?"rgba(0,0,0,.6)":"transparent"}
-                      stroke={editMode==="rect"?fontColor:"#D81F3F"} strokeWidth={1.5} strokeDasharray="6,3"/>
+                      stroke={editMode==="rect"?fontColor:"#D81F3F"} strokeWidth={1.5*ui} strokeDasharray={`${6*ui},${3*ui}`}/>
                   )}
                 </>
               )}
@@ -2166,15 +2452,15 @@ function PDFEditor({ pdfLib }) {
               const ann = pageAnnotations.find(a => a.id === selected);
               // Resizable: anything stored as a box (image, highlight, redact,
               // shapes) — i.e. has numeric w/h and isn't free text or a path.
-              const isResizable = ann && typeof ann.w === "number" && typeof ann.h === "number" && ann.type !== "text" && ann.type !== "sign";
+              const isResizable = ann && !ann.existing && typeof ann.w === "number" && typeof ann.h === "number" && ann.type !== "text" && ann.type !== "sign" && ann.type !== "note";
               if (!isResizable) return null;
               return (
                 <div style={{
                   position: "absolute",
-                  left: `${ann.x}px`,
-                  top: `${ann.y}px`,
-                  width: `${ann.w}px`,
-                  height: `${ann.h}px`,
+                  left: `${ann.x * scale}px`,
+                  top: `${ann.y * scale}px`,
+                  width: `${ann.w * scale}px`,
+                  height: `${ann.h * scale}px`,
                   pointerEvents: "none",   // empty area passes clicks through to the SVG (move), handles re-enable themselves
                   zIndex: 50,
                 }}>
@@ -2201,7 +2487,7 @@ function PDFEditor({ pdfLib }) {
                     background: selected===ann.id?"rgba(216,31,63,.1)":"rgba(0,0,0,.035)",
                     color: selected===ann.id?"#D81F3F":"#5C5C5A",
                   }}>
-                    {ann.type==="text" ? `T "${ann.text?.slice(0,18)||"…"}"` : ann.isSignature ? `signature` : ann.type==="image" ? `image` : ann.type}
+                    {ann.type==="text" ? `T "${ann.text?.slice(0,18)||"…"}"` : ann.isSignature ? `signature` : ann.type==="image" ? `image` : ann.type==="note" ? `comment` : ann.type}
                   </div>
                 ))}
               </div>
@@ -2209,7 +2495,7 @@ function PDFEditor({ pdfLib }) {
               {/* Resize panel for the selected box annotation */}
               {(() => {
                 const selAnn = annotations.find(a => a.id === selected);
-                const resizable = selAnn && typeof selAnn.w === "number" && typeof selAnn.h === "number" && selAnn.type !== "text" && selAnn.type !== "sign";
+                const resizable = selAnn && !selAnn.existing && typeof selAnn.w === "number" && typeof selAnn.h === "number" && selAnn.type !== "text" && selAnn.type !== "sign" && selAnn.type !== "note";
                 if (!resizable) return null;
                 const resizeLabel = selAnn.isSignature ? "Resize Signature"
                   : selAnn.type === "image" ? "Resize Image"
@@ -2258,55 +2544,100 @@ function PDFEditor({ pdfLib }) {
           )}
             </div>{/* end left column */}
 
-            {/* ── Comments / annotations panel (Adobe-style) ── */}
+            {/* ── Comments panel (Acrobat-style): grouped by page, searchable, threaded ── */}
             {(() => {
-              const all = annotations.filter(a => a.type === "highlight" || a.comment);
+              const repliesOf = (id) => annotations.filter(r => r.type === "reply" && r.parentId === id);
+              const all = annotations.filter(a => a.type !== "reply" && (a.type === "highlight" || a.type === "note" || (a.comment && a.comment.trim())));
               const q = commentSearch.trim().toLowerCase();
-              const items = all
-                .filter(a => !q || (a.comment||"").toLowerCase().includes(q))
-                .sort((a,b) => (a.page - b.page) || (a.y - b.y));
+              const hit = (a) => !q || [a.comment, a.author, ...repliesOf(a.id).flatMap(r => [r.comment, r.author])]
+                .some(s => (s || "").toLowerCase().includes(q));
+              const items = all.filter(hit).sort((a,b) => (a.page - b.page) || ((a.by ?? a.y) - (b.by ?? b.y)) || (a.x - b.x));
+              const groups = [];
+              items.forEach(a => { const g = groups[groups.length-1]; if (g && g.page === a.page) g.items.push(a); else groups.push({ page:a.page, items:[a] }); });
+              const typeLabel = (a) => a.type === "highlight" ? "Highlight" : a.type !== "note" ? (a.type === "image" ? (a.isSymbol ? "Symbol" : "Image") : "Shape")
+                : ({ Highlight:"Highlight", Text:"Sticky note", FreeText:"Text box", Underline:"Underline", StrikeOut:"Strikethrough", Squiggly:"Squiggly", Square:"Rectangle", Circle:"Oval", Ink:"Drawing", Line:"Line", Polygon:"Polygon", PolyLine:"Polyline", Stamp:"Stamp", FileAttachment:"Attachment", Caret:"Insert text" }[a.subtype] || a.subtype || "Comment");
+              const markText = (s) => {
+                if (!q || !s) return s;
+                const i = s.toLowerCase().indexOf(q);
+                if (i < 0) return s;
+                return <>{s.slice(0,i)}<mark style={{ background:"rgba(255,214,0,.55)", color:"inherit", borderRadius:"2px" }}>{s.slice(i, i+q.length)}</mark>{s.slice(i+q.length)}</>;
+              };
               if (!showComments) return (
-                <button onClick={()=>setShowComments(true)} title="Show comments panel" style={{ flexShrink:0, writingMode:"vertical-rl", padding:"14px 9px", borderRadius:"10px", border:`1px solid ${T.border}`, background:T.surface, color:T.dim, cursor:"pointer", fontSize:"12px", fontWeight:600, fontFamily:T.ui }}>
+                <button onClick={()=>setShowComments(true)} title="Show comments panel" style={{ flexShrink:0, position:"sticky", top:"8px", writingMode:"vertical-rl", padding:"14px 9px", borderRadius:"10px", border:`1px solid ${T.border}`, background:T.surface, color:T.dim, cursor:"pointer", fontSize:"12px", fontWeight:600, fontFamily:T.ui }}>
                   Comments{all.length?` (${all.length})`:""} ◂
                 </button>
               );
               return (
-                <aside style={{ width:"300px", flexShrink:0, background:T.surface, border:`1px solid ${T.border}`, borderRadius:"12px", display:"flex", flexDirection:"column", maxHeight:"calc(100vh - 210px)", overflow:"hidden" }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:"8px", padding:"12px 14px", borderBottom:`1px solid ${T.border}` }}>
+                <aside style={{ width:"312px", flexShrink:0, position:"sticky", top:"8px", background:T.surface, border:`1px solid ${T.border}`, borderRadius:"12px", display:"flex", flexDirection:"column", maxHeight:"calc(100vh - 120px)", overflow:"hidden", boxShadow:"0 1px 3px rgba(0,0,0,.05)" }}>
+                  <div style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"8px", padding:"12px 14px", borderBottom:`1px solid ${T.border}` }}>
                     <span style={{ color:T.accent, display:"flex" }}><Icon name="marker" size={16}/></span>
                     <div style={{ fontSize:"13px", fontWeight:600, color:T.text }}>Comments</div>
-                    <span style={{ fontSize:"11px", color:T.faint, fontFamily:T.mono }}>{all.length}</span>
+                    <span style={{ fontSize:"11px", color:T.faint, fontFamily:T.mono, background:"rgba(0,0,0,.05)", borderRadius:"10px", padding:"1px 7px" }}>{all.length}</span>
                     <button onClick={()=>setShowComments(false)} title="Hide panel" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="chevR" size={16}/></button>
                   </div>
-                  <div style={{ padding:"10px 12px", borderBottom:`1px solid ${T.border}` }}>
+                  <div style={{ flexShrink:0, padding:"10px 12px", borderBottom:`1px solid ${T.border}` }}>
                     <div style={{ display:"flex", alignItems:"center", gap:"7px", background:"rgba(0,0,0,.04)", border:`1px solid ${T.border}`, borderRadius:"8px", padding:"6px 10px" }}>
                       <span style={{ color:T.faint, display:"flex" }}><Icon name="zoomIn" size={14}/></span>
-                      <input value={commentSearch} onChange={e=>setCommentSearch(e.target.value)} placeholder="Search notes…" style={{ flex:1, border:"none", background:"none", outline:"none", fontSize:"12px", color:T.text, fontFamily:T.ui }}/>
+                      <input value={commentSearch} onChange={e=>setCommentSearch(e.target.value)} placeholder="Search comments…" style={{ flex:1, minWidth:0, border:"none", background:"none", outline:"none", fontSize:"12px", color:T.text, fontFamily:T.ui }}/>
+                      {commentSearch && <span style={{ fontSize:"10.5px", color:T.faint, fontFamily:T.mono }}>{items.length}</span>}
                       {commentSearch && <button onClick={()=>setCommentSearch("")} style={{ background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={13}/></button>}
                     </div>
                   </div>
-                  <div style={{ overflowY:"auto", padding:"8px", display:"flex", flexDirection:"column", gap:"7px" }}>
+                  <div ref={panelListRef} style={{ flex:"1 1 auto", minHeight:0, overflowY:"auto", padding:"4px 10px 10px" }}>
                     {items.length === 0 && (
-                      <div style={{ padding:"22px 12px", textAlign:"center", color:T.faintest, fontSize:"12px", lineHeight:1.6 }}>
-                        {all.length ? "No notes match your search." : "Use the Highlight tool, then add a note here. Click a note to jump to it."}
+                      <div style={{ padding:"26px 12px", textAlign:"center", color:T.faintest, fontSize:"12px", lineHeight:1.6 }}>
+                        {all.length ? "No comments match your search." : "No comments yet. Use the Highlight tool, then click its marker to write a note."}
                       </div>
                     )}
-                    {items.map(a => {
-                      const sel = selected === a.id;
-                      const swatch = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : T.accent;
-                      return (
-                        <div key={a.id} onClick={()=>goToAnnotation(a)} style={{ border:`1px solid ${sel?T.accent:T.border}`, borderRadius:"9px", background: sel?"rgba(216,31,63,.05)":"rgba(0,0,0,.015)", overflow:"hidden", cursor:"pointer", transition:"border-color .12s" }}>
-                          <div style={{ display:"flex", alignItems:"center", gap:"8px", padding:"8px 10px" }}>
-                            <span style={{ width:"13px", height:"13px", borderRadius:"3px", background:swatch, border:"1px solid rgba(0,0,0,.2)", flexShrink:0 }}/>
-                            <span style={{ fontSize:"11px", color:sel?T.accent:T.dim, fontWeight:600 }}>{a.existing ? "PDF note" : a.type==="highlight" ? "Highlight" : a.type} · p.{a.page+1}</span>
-                            <button onClick={e=>{ e.stopPropagation(); pushHistory(annotations.filter(x=>x.id!==a.id)); if(selected===a.id){ setSelected(null); setActiveComment(null); } }} title="Delete" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faintest, cursor:"pointer", display:"flex" }} onMouseEnter={e=>e.currentTarget.style.color=T.bad} onMouseLeave={e=>e.currentTarget.style.color=T.faintest}><Icon name="trash" size={13}/></button>
-                          </div>
-                          <div style={{ borderTop:`1px solid ${T.border}`, padding:"8px 10px", fontSize:"12px", lineHeight:1.5, color: a.comment ? T.text : T.faintest, fontStyle: a.comment ? "normal" : "italic", whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
-                            {a.comment ? a.comment : "Add a note…"}
-                          </div>
+                    {groups.map(g => (
+                      <div key={g.page} style={{ display:"flex", flexDirection:"column", gap:"8px" }}>
+                        <div style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"6px", padding:"10px 2px 0", fontSize:"10.5px", letterSpacing:".08em", textTransform:"uppercase", color:T.faint, fontWeight:600 }}>
+                          Page {g.page+1}<span style={{ flex:1, height:"1px", background:T.border }}/><span style={{ fontFamily:T.mono, letterSpacing:0 }}>{g.items.length}</span>
                         </div>
-                      );
-                    })}
+                        {g.items.map(a => {
+                          const sel = selected === a.id || activeComment === a.id;
+                          const bar = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : (a.color || "#D81F3F");
+                          const reps = repliesOf(a.id);
+                          const who = a.author || (a.existing ? "Unknown author" : "You");
+                          return (
+                            <div key={a.id} data-ann={a.id} onClick={()=>goToAnnotation(a)} className="cmt-card" style={{
+                              flexShrink:0, position:"relative", border:`1px solid ${sel?T.accent:T.border}`, borderLeft:`4px solid ${bar.replace(/,\s*0?\.\d+\)$/, ",0.95)")}`,
+                              borderRadius:"8px", background: sel?"rgba(216,31,63,.045)":"#fff", cursor:"pointer",
+                              boxShadow: sel ? "0 0 0 3px rgba(216,31,63,.10)" : "0 1px 2px rgba(0,0,0,.04)", transition:"border-color .12s, box-shadow .12s",
+                            }}>
+                              <div style={{ display:"flex", alignItems:"center", gap:"7px", padding:"8px 10px 4px" }}>
+                                <span style={{ width:"22px", height:"22px", borderRadius:"50%", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(216,31,63,.10)", color:T.accent, fontSize:"10.5px", fontWeight:700 }}>
+                                  {(who.trim()[0] || "?").toUpperCase()}
+                                </span>
+                                <div style={{ minWidth:0, flex:1 }}>
+                                  <div style={{ fontSize:"12px", fontWeight:600, color:T.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{markText(who)}</div>
+                                  <div style={{ fontSize:"10.5px", color:T.faint, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{typeLabel(a)}{a.date ? " · " + formatNoteDate(a.date) : ""}</div>
+                                </div>
+                                <button onClick={e=>{ e.stopPropagation(); removeAnnotation(a.id); }} title="Delete comment" className="cmt-del" style={{ flexShrink:0, background:"none", border:"none", color:T.faintest, cursor:"pointer", display:"flex", padding:"3px", borderRadius:"5px" }} onMouseEnter={e=>e.currentTarget.style.color=T.bad} onMouseLeave={e=>e.currentTarget.style.color=T.faintest}><Icon name="trash" size={13}/></button>
+                              </div>
+                              <div style={{
+                                padding:"2px 10px 9px 39px", fontSize:"12.5px", lineHeight:1.5, color: a.comment ? T.text : T.faintest, fontStyle: a.comment ? "normal" : "italic",
+                                whiteSpace:"pre-wrap", wordBreak:"break-word",
+                                ...(sel ? {} : { display:"-webkit-box", WebkitLineClamp:4, WebkitBoxOrient:"vertical", overflow:"hidden" }),
+                              }}>
+                                {a.comment ? markText(a.comment) : "Add a note…"}
+                              </div>
+                              {reps.length > 0 && (
+                                <div style={{ margin:"0 10px 9px 39px", paddingLeft:"9px", borderLeft:`2px solid ${T.border}`, display:"flex", flexDirection:"column", gap:"6px" }}>
+                                  {reps.map(r => (
+                                    <div key={r.id} style={{ fontSize:"12px", lineHeight:1.45 }}>
+                                      <span style={{ fontWeight:600, color:T.text }}>{markText(r.author || "Reply")}</span>
+                                      {r.date ? <span style={{ color:T.faint, fontSize:"10.5px" }}> · {formatNoteDate(r.date)}</span> : null}
+                                      <div style={{ color:T.dim, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>{r.comment ? markText(r.comment) : <i style={{ color:T.faintest }}>(empty)</i>}</div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
                   </div>
                 </aside>
               );
@@ -2317,38 +2648,52 @@ function PDFEditor({ pdfLib }) {
           {activeComment != null && (() => {
             const a = annotations.find(x => x.id === activeComment);
             if (!a) return null;
-            const readOnly = false;   // imported notes are editable too (updated in place on save)
-            const swatch = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : (a.existing ? "#D81F3F" : T.accent);
+            const readOnly = !!a.readOnly;   // e.g. a FreeText box — its visible text lives in the page itself
+            const reps = annotations.filter(r => r.type === "reply" && r.parentId === a.id);
+            const bar = a.type==="highlight" ? (a.color||"rgba(255,230,0,.45)") : (a.color || "#D81F3F");
+            const who = a.author || (a.existing ? "Unknown author" : "You");
+            const setText = (id, v) => setAnnotations(prev => prev.map(x => x.id===id ? {...x, comment:v} : x));
+            const keys = (e) => { if (e.key==="Escape") closeCommentPopup(); if (e.key==="Enter" && (e.ctrlKey||e.metaKey)) closeCommentPopup(); };
+            const ta = { width:"100%", border:`1px solid ${T.border}`, borderRadius:"8px", background:"#fff", padding:"8px 10px", fontSize:"13px", color:T.text, fontFamily:T.ui, outline:"none", resize:"vertical", lineHeight:1.5, boxSizing:"border-box" };
             return (
               <>
                 <div onMouseDown={closeCommentPopup} style={{ position:"fixed", inset:0, zIndex:1190, background:"transparent" }}/>
-                <div onMouseDown={e=>e.stopPropagation()} style={{ position:"fixed", left:commentPos.left+"px", top:commentPos.top+"px", zIndex:1200, width:"270px", background:"#fff", border:`1px solid ${T.borderUp}`, borderRadius:"12px", boxShadow:"0 16px 44px rgba(0,0,0,.26)", overflow:"hidden", animation:"fadeIn .12s" }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:"8px", padding:"10px 12px", borderBottom:`1px solid ${T.border}`, background:"rgba(0,0,0,.02)" }}>
-                    <span style={{ width:"13px", height:"13px", borderRadius:"3px", background:swatch, border:"1px solid rgba(0,0,0,.2)", flexShrink:0 }}/>
-                    <span style={{ fontSize:"12px", fontWeight:600, color:T.text }}>{a.existing ? "Note (from PDF)" : "Note"}</span>
-                    <span style={{ fontSize:"10.5px", color:T.faint, fontFamily:T.mono }}>p.{a.page+1}</span>
-                    <button onClick={closeCommentPopup} title="Close" style={{ marginLeft:"auto", background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={15}/></button>
-                  </div>
-                  {readOnly ? (
-                    <div style={{ padding:"11px 13px", fontSize:"13px", lineHeight:1.6, color:T.text, whiteSpace:"pre-wrap", wordBreak:"break-word", maxHeight:"260px", overflowY:"auto" }}>
-                      {a.comment || <span style={{ color:T.faintest, fontStyle:"italic" }}>(empty note)</span>}
+                <div onMouseDown={e=>e.stopPropagation()} style={{ position:"fixed", left:commentPos.left+"px", top:commentPos.top+"px", zIndex:1200, width:"300px", maxHeight:"calc(100vh - 24px)", display:"flex", flexDirection:"column", background:"#fff", border:`1px solid ${T.borderUp}`, borderTop:`4px solid ${bar.replace(/,\s*0?\.\d+\)$/, ",0.95)")}`, borderRadius:"12px", boxShadow:"0 16px 44px rgba(0,0,0,.26)", overflow:"hidden", animation:"fadeIn .12s" }}>
+                  <div style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"8px", padding:"9px 12px", borderBottom:`1px solid ${T.border}`, background:"rgba(0,0,0,.02)" }}>
+                    <span style={{ width:"22px", height:"22px", borderRadius:"50%", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(216,31,63,.10)", color:T.accent, fontSize:"10.5px", fontWeight:700 }}>{(who.trim()[0] || "?").toUpperCase()}</span>
+                    <div style={{ minWidth:0, flex:1 }}>
+                      <div style={{ fontSize:"12.5px", fontWeight:600, color:T.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{who}</div>
+                      <div style={{ fontSize:"10.5px", color:T.faint }}>Page {a.page+1}{a.date ? " · " + formatNoteDate(a.date) : ""}</div>
                     </div>
-                  ) : (
-                    <>
-                      <textarea ref={commentInputRef}
-                        value={a.comment || ""}
-                        onChange={e => setAnnotations(prev => prev.map(x => x.id===a.id ? {...x, comment:e.target.value} : x))}
-                        onKeyDown={e => { if (e.key==="Escape") closeCommentPopup(); if (e.key==="Enter" && (e.ctrlKey||e.metaKey)) closeCommentPopup(); }}
-                        placeholder="Type your note… (Ctrl+Enter to save)"
-                        rows={4}
-                        style={{ width:"100%", border:"none", background:"transparent", padding:"11px 13px", fontSize:"13px", color:T.text, fontFamily:T.ui, outline:"none", resize:"vertical", lineHeight:1.55, boxSizing:"border-box" }}
-                      />
-                      <div style={{ display:"flex", gap:"8px", padding:"0 12px 11px", justifyContent:"flex-end" }}>
-                        {a.comment && <button onClick={()=>setAnnotations(prev=>prev.map(x=>x.id===a.id?{...x, comment:""}:x))} style={{ padding:"6px 12px", borderRadius:"8px", border:`1px solid rgba(176,30,46,.3)`, background:"rgba(176,30,46,.07)", color:T.bad, cursor:"pointer", fontSize:"12px", fontFamily:T.ui }}>Clear</button>}
-                        <button onClick={closeCommentPopup} style={{ padding:"6px 16px", borderRadius:"8px", border:"none", background:T.accent, color:"#fff", cursor:"pointer", fontSize:"12px", fontWeight:600, fontFamily:T.ui }}>Done</button>
+                    <button onClick={closeCommentPopup} title="Close (Esc)" style={{ background:"none", border:"none", color:T.faint, cursor:"pointer", display:"flex" }}><Icon name="close" size={15}/></button>
+                  </div>
+                  <div style={{ overflowY:"auto", padding:"10px 12px", display:"flex", flexDirection:"column", gap:"10px" }}>
+                    {readOnly ? (
+                      <div style={{ fontSize:"13px", lineHeight:1.6, color:T.text, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                        {a.comment || <span style={{ color:T.faintest, fontStyle:"italic" }}>(empty note)</span>}
+                        <div style={{ marginTop:"6px", fontSize:"10.5px", color:T.faint }}>Text box — its text is part of the page and can't be edited here.</div>
                       </div>
-                    </>
-                  )}
+                    ) : (
+                      <textarea ref={commentInputRef} value={a.comment || ""} onChange={e => setText(a.id, e.target.value)} onKeyDown={keys}
+                        placeholder="Write a note…" rows={Math.min(8, Math.max(3, ((a.comment||"").match(/\n/g)||[]).length + 2))} style={ta}/>
+                    )}
+                    {reps.length > 0 && (
+                      <div style={{ display:"flex", flexDirection:"column", gap:"8px", paddingLeft:"10px", borderLeft:`2px solid ${T.border}` }}>
+                        <div style={{ fontSize:"10.5px", letterSpacing:".07em", textTransform:"uppercase", color:T.faint, fontWeight:600 }}>Replies ({reps.length})</div>
+                        {reps.map(r => (
+                          <div key={r.id}>
+                            <div style={{ fontSize:"11.5px", color:T.dim, marginBottom:"3px" }}><b style={{ color:T.text }}>{r.author || "Reply"}</b>{r.date ? " · " + formatNoteDate(r.date) : ""}</div>
+                            <textarea value={r.comment || ""} onChange={e => setText(r.id, e.target.value)} onKeyDown={keys} rows={2} style={{ ...ta, fontSize:"12.5px" }}/>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"8px", padding:"9px 12px", borderTop:`1px solid ${T.border}` }}>
+                    <button onClick={() => removeAnnotation(a.id)} title="Delete this comment" style={{ display:"flex", alignItems:"center", gap:"5px", padding:"6px 10px", borderRadius:"8px", border:`1px solid rgba(176,30,46,.3)`, background:"rgba(176,30,46,.06)", color:T.bad, cursor:"pointer", fontSize:"12px", fontFamily:T.ui }}><Icon name="trash" size={13}/>Delete</button>
+                    <span style={{ fontSize:"10.5px", color:T.faintest, marginLeft:"auto" }}>Ctrl+Enter</span>
+                    <button onClick={closeCommentPopup} style={{ padding:"6px 16px", borderRadius:"8px", border:"none", background:T.accent, color:"#fff", cursor:"pointer", fontSize:"12px", fontWeight:600, fontFamily:T.ui }}>Done</button>
+                  </div>
                 </div>
               </>
             );
